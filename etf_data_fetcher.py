@@ -40,15 +40,40 @@ def last_complete_session_date() -> pd.Timestamp:
     return cutoff
 
 
+def use_live_bar() -> bool:
+    """更新榜单时含当天未收盘日K。本地网页默认关闭。"""
+    return os.environ.get("ETF_USE_LIVE_BAR", "").strip().lower() in ("1", "true", "yes")
+
+
+def bar_end_date() -> pd.Timestamp:
+    """K 线允许保留到的日期。live 模式含当天（周末顺延到周五）。"""
+    if not use_live_bar():
+        return last_complete_session_date()
+    now = pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None)
+    cutoff = now.normalize()
+    while int(cutoff.weekday()) >= 5:
+        cutoff -= pd.Timedelta(days=1)
+    return cutoff
+
+
 def data_asof_str() -> str:
-    return last_complete_session_date().strftime("%Y-%m-%d")
+    return bar_end_date().strftime("%Y-%m-%d")
+
+
+def live_bar_note() -> str:
+    if not use_live_bar():
+        return ""
+    now = pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None)
+    if now.hour < 15 or (now.hour == 15 and now.minute < 5):
+        return "含当日未收盘价"
+    return "当日已收盘"
 
 
 def clip_to_last_complete(df: pd.DataFrame) -> pd.DataFrame:
-    """去掉未收盘的当日K线，榜单/指标一律截止上一交易日。"""
+    """默认去掉未收盘的当日K。ETF_USE_LIVE_BAR=1 时保留当天已走出的价格。"""
     if df is None or df.empty:
         return df
-    cutoff = last_complete_session_date()
+    cutoff = bar_end_date()
     out = df.copy()
     idx = pd.to_datetime(out.index)
     if getattr(idx, "tz", None) is not None:
@@ -246,7 +271,7 @@ def _fetch_eastmoney_direct(symbol: str) -> pd.DataFrame:
                 "klt": "101",
                 "fqt": "1",
                 "beg": "19700101",
-                "end": last_complete_session_date().strftime("%Y%m%d"),
+                "end": bar_end_date().strftime("%Y%m%d"),
                 "secid": f"{market_id}.{code}",
             }
             for attempt in range(2):
@@ -304,7 +329,7 @@ def _fetch_from_eastmoney(symbol: str) -> pd.DataFrame:
                 symbol=code,
                 period="daily",
                 adjust="qfq",
-                end_date=last_complete_session_date().strftime("%Y%m%d"),
+                end_date=bar_end_date().strftime("%Y%m%d"),
             ),
             retries=2,
         )

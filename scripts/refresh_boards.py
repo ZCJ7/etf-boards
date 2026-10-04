@@ -4,16 +4,19 @@
     python scripts/refresh_boards.py
 
 GitHub Actions：手动 Run workflow 调用本脚本，发布 GitHub Pages。
-15:05 前按上一完整交易日收盘；15:05 后用当天已收盘价。
+交易时段用当天已走出的未收盘日K（例如 14:30 的价格）；收盘后即为收盘价。
 东财不通则整次刷新改走新浪。
 """
 
 from __future__ import annotations
 
 import html
+import os
 import sys
 import traceback
 from pathlib import Path
+
+os.environ["ETF_USE_LIVE_BAR"] = "1"
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -27,7 +30,7 @@ from analysis.board_store import BOARD_DIR, load_boards_snapshot, now_cst_iso, s
 from analysis.low_position_screener import get_low_position_top30
 from analysis.reversal_screener import get_reversal_top30
 from analysis.screener import get_momentum_top30
-from etf_data_fetcher import active_hist_source, data_asof_str, hist_prefer_sina
+from etf_data_fetcher import active_hist_source, data_asof_str, hist_prefer_sina, live_bar_note
 
 
 def _run_one(label: str, fn):
@@ -66,6 +69,7 @@ def write_pages_html(
     boards: dict,
     errors: dict[str, str],
     source: str,
+    bar_note: str = "",
 ) -> None:
     docs = ROOT / "docs"
     docs.mkdir(parents=True, exist_ok=True)
@@ -100,7 +104,7 @@ def write_pages_html(
 </head>
 <body>
   <h1>ETF 榜单</h1>
-  <p class="meta">更新时刻（上海）：{html.escape(generated_at)} · 行情截止：{html.escape(asof)} · 数据源：{html.escape(source)}（东财失败自动切新浪）</p>
+  <p class="meta">更新时刻（上海）：{html.escape(generated_at)} · 行情截止：{html.escape(asof)}{(" · " + html.escape(bar_note)) if bar_note else ""} · 数据源：{html.escape(source)}（东财失败自动切新浪）</p>
   {err_html}
   {body}
 </body>
@@ -112,9 +116,10 @@ def write_pages_html(
 
 def main() -> int:
     asof = data_asof_str()
+    bar_note = live_bar_note()
     generated_at = now_cst_iso()
     source = "sina" if hist_prefer_sina() else "eastmoney"
-    print(f"refresh at {generated_at} CST · asof {asof} · source {source}", flush=True)
+    print(f"refresh at {generated_at} CST · asof {asof} · {bar_note or '收盘K'} · source {source}", flush=True)
     print(f"active hist source: {active_hist_source()}", flush=True)
 
     errors: dict[str, str] = {}
@@ -144,6 +149,7 @@ def main() -> int:
         {"low_position": low, "reversal": rev, "momentum": mom},
         errors,
         source,
+        bar_note,
     )
     snap = load_boards_snapshot()
     rows = (snap or {}).get("meta", {}).get("rows", {})

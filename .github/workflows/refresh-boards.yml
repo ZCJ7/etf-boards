@@ -35,6 +35,7 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
           TZ: Asia/Shanghai
+          ETF_USE_LIVE_BAR: "1"
         run: python scripts/refresh_boards.py
 
       - name: Commit snapshot
