@@ -11,7 +11,14 @@ from analysis.reversal_screener import (
     _format_volume,
     _to_weekly,
 )
-from analysis.screener import POOL_SIZE, SECTOR_TOP_N, _fetch_spot_pool
+from analysis.screener import (
+    EXCESS_60_COL,
+    POOL_SIZE,
+    SECTOR_TOP_N,
+    _fetch_spot_pool,
+    excess_vs_hs300_60,
+    load_hs300_close,
+)
 from etf_data_fetcher import data_asof_str, fetch_pool_daily
 from utils import clean_etf_symbol
 
@@ -110,6 +117,11 @@ def _get_low_position_top30_asof(pool_size: int, asof: str) -> pd.DataFrame:
     if got < max(15, len(codes) // 6):
         raise RuntimeError(f"日线行情不足（成功 {got}/{len(codes)}），请稍后重试")
 
+    try:
+        hs300_close = load_hs300_close()
+    except Exception:
+        hs300_close = None
+
     rows: list[dict] = []
     n_ma = n_slope = n_macd = 0
     for code in codes:
@@ -145,6 +157,7 @@ def _get_low_position_top30_asof(pool_size: int, asof: str) -> pd.DataFrame:
                     "名称": name_map.get(code, ""),
                     "板块": sector_map.get(code, ""),
                     "收盘价": round(last_close, 3),
+                    EXCESS_60_COL: excess_vs_hs300_60(d_close, hs300_close),
                     "离周MA20%": round(float(dist), 2) if dist is not None else None,
                     "周MA60斜率%": round(float(slope_pct), 3) if slope_pct is not None else None,
                     "周MA60方向": slope_label,
@@ -173,6 +186,7 @@ def _get_low_position_top30_asof(pool_size: int, asof: str) -> pd.DataFrame:
         "代码",
         "名称",
         "收盘价",
+        EXCESS_60_COL,
         "离周MA20%",
         "周MA60方向",
         "周MA60斜率%",

@@ -237,6 +237,29 @@ def _n_day_return(close: pd.Series, n: int) -> float | None:
     return (last / base - 1) * 100
 
 
+HS300_CODE = "510300"
+EXCESS_60_COL = "相对沪深300(60日)%"
+
+
+def load_hs300_close(tail_days: int = 120) -> pd.Series:
+    df, _ = fetch_etf_daily_cached(HS300_CODE, tail_days=tail_days, prefer_sina=None)
+    return ensure_close(df)
+
+
+def excess_vs_hs300_60(close: pd.Series, hs300_close: pd.Series | None = None) -> float | None:
+    """ETF近60日涨幅 − 沪深300近60日涨幅（百分点）。"""
+    if hs300_close is None:
+        try:
+            hs300_close = load_hs300_close()
+        except Exception:
+            return None
+    etf_ret = _n_day_return(close, 60)
+    den_ret = _n_day_return(hs300_close, 60)
+    if etf_ret is None or den_ret is None:
+        return None
+    return round(etf_ret - den_ret, 2)
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def _load_full_spot_asof(asof: str) -> pd.DataFrame:
     """全市场 ETF 名单（成交额用于排序）。东财失败则新浪/同花顺/本地快照。"""
@@ -517,12 +540,33 @@ def _get_momentum_top30_asof(denominator: str, period_days: int, asof: str) -> p
             out.at[idx, "日均成交额"] = refined[code]
     out["日均成交额(显示)"] = out["日均成交额"].map(_format_amount)
 
+    try:
+        hs300_close = load_hs300_close()
+        daily_map = fetch_pool_daily(
+            out["代码"].tolist(),
+            tail_days=90,
+            max_workers=2,
+            pause_sec=0.1,
+            prefer_sina=None,
+        )
+        excess: list[float | None] = []
+        for code in out["代码"].tolist():
+            df = daily_map.get(str(code), pd.DataFrame())
+            if df is None or df.empty:
+                excess.append(None)
+                continue
+            excess.append(excess_vs_hs300_60(ensure_close(df), hs300_close))
+        out[EXCESS_60_COL] = excess
+    except Exception:
+        out[EXCESS_60_COL] = None
+
     cols = [
         "板块排名",
         "板块",
         "代码",
         "名称",
         "成交龙头涨幅%",
+        EXCESS_60_COL,
         "日均成交额(显示)",
         "相对强度",
         "强度龙头代码",
