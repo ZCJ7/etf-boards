@@ -64,6 +64,8 @@ def live_bar_note() -> str:
     if not use_live_bar():
         return ""
     now = pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None)
+    if int(now.weekday()) >= 5:
+        return "休市，用最近交易日收盘"
     if now.hour < 15 or (now.hour == 15 and now.minute < 5):
         return "含当日未收盘价"
     return "当日已收盘"
