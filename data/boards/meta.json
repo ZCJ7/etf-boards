@@ -1,0 +1,14 @@
+{
+  "asof": "2026-10-02",
+  "generated_at": "2026-10-04 12:18:12",
+  "timezone": "Asia/Shanghai",
+  "source": "sina",
+  "momentum_denominator": "510300",
+  "momentum_period": 20,
+  "rows": {
+    "low_position": 3,
+    "reversal": 14,
+    "momentum": 30
+  },
+  "errors": {}
+}

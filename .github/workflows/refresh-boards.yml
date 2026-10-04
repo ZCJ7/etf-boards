@@ -1,0 +1,50 @@
+# 手动 Run workflow：按当时行情重算三张榜单，写回 docs/index.html。
+# 东财不通则整次刷新走新浪。
+# 网址：https://zcj7.github.io/etf-boards/
+name: Refresh ETF boards
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-etf-boards
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ${{ vars.BOARD_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-boards.txt
+
+      - name: Install
+        run: pip install -r requirements-boards.txt
+
+      - name: Refresh boards
+        env:
+          PYTHONUNBUFFERED: "1"
+          TZ: Asia/Shanghai
+        run: python scripts/refresh_boards.py
+
+      - name: Commit snapshot
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/boards docs/index.html
+          if git diff --cached --quiet; then
+            echo "no board changes"
+          else
+            git commit -m "chore: refresh ETF boards"
+            git push
+          fi
