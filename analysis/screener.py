@@ -264,15 +264,15 @@ def excess_vs_hs300_60(close: pd.Series, hs300_close: pd.Series | None = None) -
 def _load_full_spot_asof(asof: str) -> pd.DataFrame:
     """全市场 ETF 名单（成交额用于排序）。东财失败则新浪/同花顺/本地快照。"""
     sources: list[tuple[str, callable, float]] = [
-        ("eastmoney", _fetch_spot_eastmoney, 70),
-        ("sina", _fetch_spot_sina, 20),
-        ("ths", _fetch_spot_ths, 15),
+        ("eastmoney", _fetch_spot_eastmoney, 12),
+        ("sina", _fetch_spot_sina, 12),
+        ("ths", _fetch_spot_ths, 10),
     ]
     if hist_prefer_sina():
         sources = [
-            ("sina", _fetch_spot_sina, 20),
-            ("ths", _fetch_spot_ths, 15),
-            ("eastmoney", _fetch_spot_eastmoney, 25),
+            ("sina", _fetch_spot_sina, 12),
+            ("ths", _fetch_spot_ths, 10),
+            ("eastmoney", _fetch_spot_eastmoney, 8),
         ]
     last_err = "现货接口均失败"
     for _name, fn, timeout in sources:
@@ -375,10 +375,24 @@ def _fetch_spot_pool() -> pd.DataFrame:
     return full.sort_values("成交额", ascending=False).head(POOL_SIZE).reset_index(drop=True)
 
 
+_RANK_FRAME: pd.DataFrame | None = None
+
+
+def _exchange_rank() -> pd.DataFrame:
+    """东财涨幅排行只拉一次，12 秒没返回就放弃，避免榜单流程停在无超时的请求上。"""
+    global _RANK_FRAME
+    if _RANK_FRAME is not None:
+        return _RANK_FRAME
+    _RANK_FRAME = _call_spot(ak.fund_exchange_rank_em, 12)
+    return _RANK_FRAME
+
+
 def _merge_rank_returns(pool: pd.DataFrame, period_days: int) -> pd.DataFrame:
     try:
-        rank = ak.fund_exchange_rank_em()
+        rank = _exchange_rank()
     except Exception:
+        rank = pd.DataFrame()
+    if rank is None or rank.empty:
         pool[f"近{period_days}日涨幅%"] = None
         return pool
 
@@ -453,7 +467,7 @@ def _denominator_return(denominator: str, period_days: int) -> float:
         pass
 
     try:
-        rank = ak.fund_exchange_rank_em()
+        rank = _exchange_rank()
         code_col = _col_match(list(rank.columns), "基金", "代码") or _col_match(list(rank.columns), "代码")
         ret_col = _col_match(list(rank.columns), "近1月")
         for key in _PERIOD_RET_COL.get(period_days, ("近1月",)):

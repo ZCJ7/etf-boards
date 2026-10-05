@@ -231,6 +231,32 @@ _SINA_HEADERS = {
 }
 
 
+def _eastmoney_reachable() -> bool:
+    """短超时探测。不通就切新浪，避免把整段日 K 的重试耗在东财上。"""
+    params = {
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "ut": _UT_TOKENS[0],
+        "klt": "101",
+        "fqt": "1",
+        "beg": "20240101",
+        "end": bar_end_date().strftime("%Y%m%d"),
+        "secid": "1.510300",
+    }
+    try:
+        resp = requests.get(
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+            params=params,
+            headers=EASTMONEY_HEADERS,
+            timeout=5,
+        )
+        resp.raise_for_status()
+        klines = (resp.json().get("data") or {}).get("klines") or []
+        return bool(klines)
+    except Exception:
+        return False
+
+
 def hist_prefer_sina() -> bool:
     """探测东财；不通则本进程一律走新浪。可用 ETF_PREFER_SINA=1 强制。"""
     global _PREFER_SINA
@@ -246,11 +272,7 @@ def hist_prefer_sina() -> bool:
         if forced in ("0", "false", "no", "eastmoney"):
             _PREFER_SINA = False
             return False
-        try:
-            df = _fetch_eastmoney_direct("510300")
-            _PREFER_SINA = df is None or df.empty
-        except Exception:
-            _PREFER_SINA = True
+        _PREFER_SINA = not _eastmoney_reachable()
         return _PREFER_SINA
 
 
@@ -346,7 +368,7 @@ def _fetch_from_sina_kline_api(symbol: str) -> pd.DataFrame:
                 _SINA_KLINE_URL,
                 params={"symbol": sina_sym, "scale": "240", "ma": "no", "datalen": "1023"},
                 headers=_SINA_HEADERS,
-                timeout=20,
+                timeout=8,
             )
             resp.raise_for_status()
             text = (resp.text or "").strip()
@@ -390,35 +412,74 @@ def _fetch_from_sina(symbol: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+_FULL_CACHE: dict[tuple, tuple[pd.DataFrame, str]] = {}
+_FULL_LOCK = threading.Lock()
+
+
+def _hist_worker_cap() -> int:
+    raw = os.environ.get("ETF_HIST_WORKERS", "").strip()
+    if raw.isdigit():
+        return max(1, min(int(raw), 16))
+    return 8
+
+
+def _download_daily(symbol: str, use_sina: bool) -> tuple[pd.DataFrame, str]:
+    """拉完整日 K。新浪只用 HTTP JSON，方便并发；不走 MiniRacer。"""
+    errors: list[str] = []
+    fetchers = (
+        [("sina", lambda: _fetch_from_sina_kline_api(symbol)), ("eastmoney", lambda: _fetch_from_eastmoney(symbol))]
+        if use_sina
+        else [("eastmoney", lambda: _fetch_from_eastmoney(symbol)), ("sina", lambda: _fetch_from_sina_kline_api(symbol))]
+    )
+    for name, fetcher in fetchers:
+        try:
+            df = fetcher()
+            if df is None or df.empty:
+                continue
+            df = clip_to_last_complete(df)
+            if df.empty:
+                continue
+            label = "akshare-eastmoney" if name == "eastmoney" else "sina-http"
+            if name == "sina" and df.attrs.get("split_adjusted"):
+                label = "sina-http(前复权)"
+            return df, label
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+    raise RuntimeError(f"无法获取 {symbol}: {' | '.join(errors)}")
+
+
+def _cached_daily(symbol: str, use_sina: bool) -> tuple[pd.DataFrame, str]:
+    key = (clean_etf_symbol(symbol), bool(use_sina), data_asof_str(), use_live_bar())
+    with _FULL_LOCK:
+        hit = _FULL_CACHE.get(key)
+    if hit is not None:
+        df, label = hit
+        return df.copy(), label
+    df, label = _download_daily(symbol, use_sina)
+    with _FULL_LOCK:
+        _FULL_CACHE[key] = (df, label)
+    return df.copy(), label
+
+
 def fetch_etf_daily(
     symbol: str,
     tail_days: int | None = None,
     prefer_sina: bool = False,
 ) -> tuple[pd.DataFrame, str]:
-    """优先东财，失败则用新浪。东财探测不通时直接走新浪。"""
-    errors: list[str] = []
+    """优先东财，失败则用新浪。同一进程里相同代码只下载一次。"""
     use_sina = bool(prefer_sina) or hist_prefer_sina()
-    fetchers = (
-        [("sina", lambda: _fetch_from_sina(symbol)), ("eastmoney", lambda: _fetch_from_eastmoney(symbol))]
-        if use_sina
-        else [("eastmoney", lambda: _fetch_from_eastmoney(symbol)), ("sina", lambda: _fetch_from_sina(symbol))]
-    )
-    for name, fetcher in fetchers:
+    try:
+        df, label = _cached_daily(symbol, use_sina)
+    except Exception as first_exc:
+        if use_sina:
+            raise
         try:
-            df = fetcher()
-            if not df.empty:
-                df = clip_to_last_complete(df)
-                if df.empty:
-                    continue
-                if tail_days and len(df) > tail_days:
-                    df = df.tail(tail_days)
-                label = "akshare-eastmoney" if name == "eastmoney" else "akshare-sina"
-                if name == "sina" and df.attrs.get("split_adjusted"):
-                    label = "akshare-sina(前复权)"
-                return df, label
-        except Exception as exc:
-            errors.append(f"{name}: {exc}")
-    raise RuntimeError(f"无法获取 {symbol}: {' | '.join(errors)}")
+            df, label = _cached_daily(symbol, True)
+        except Exception:
+            raise first_exc
+    if tail_days and len(df) > tail_days:
+        df = df.tail(tail_days).copy()
+    return df, label
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -476,8 +537,13 @@ def fetch_pool_daily(
         result[unique[0]] = df
         return result
 
-    # 新浪路径即使用锁，并行也无收益；单线程更稳
-    workers = 1 if use_sina else min(max_workers, len(unique))
+    # 新浪日 K 走 HTTP JSON，可以并发。MiniRacer 不在这条路径上。
+    if use_sina:
+        workers = min(_hist_worker_cap(), len(unique))
+    else:
+        workers = min(max(1, max_workers), len(unique))
+    show = os.environ.get("ETF_USE_LIVE_BAR", "").strip().lower() in ("1", "true", "yes")
+    done = 0
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(_fetch_one, sym, tail_days, use_sina): sym for sym in unique}
         for future in as_completed(futures):
@@ -487,7 +553,10 @@ def fetch_pool_daily(
                 sym = futures[future]
                 df = pd.DataFrame()
             result[sym] = df
-            if pause_sec > 0:
+            done += 1
+            if show and (done % 40 == 0 or done == len(unique)):
+                print(f"    日K {done}/{len(unique)}", flush=True)
+            if pause_sec > 0 and workers == 1:
                 time.sleep(pause_sec)
     return result
 
