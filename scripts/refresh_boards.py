@@ -11,6 +11,7 @@ GitHub Actions：手动 Run workflow 调用本脚本，发布 GitHub Pages。
 from __future__ import annotations
 
 import html
+import json
 import os
 import sys
 import traceback
@@ -253,6 +254,9 @@ def write_pages_html(
     source: str,
     bar_note: str = "",
     style_html: str = "",
+    support_html: str = "",
+    resist_html: str = "",
+    levels_script: str = "",
 ) -> None:
     docs = ROOT / "docs"
     docs.mkdir(parents=True, exist_ok=True)
@@ -297,6 +301,11 @@ def write_pages_html(
     .legend {{ display: flex; flex-wrap: wrap; gap: 10px; color: #334155; font-size: 0.82rem; margin: 4px 4px 8px; }}
     .legend i {{ display: inline-block; width: 12px; height: 3px; margin-right: 4px; vertical-align: middle; }}
     h3 {{ font-size: 1rem; margin: 14px 0 4px; }}
+    .tabs {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 4px; }}
+    .tab {{ border: 1px solid #cbd5e1; background: #fff; border-radius: 999px; padding: 8px 14px; font-size: 0.95rem; }}
+    .tab.on {{ background: #0f172a; color: #fff; border-color: #0f172a; }}
+    .search {{ width: 100%; box-sizing: border-box; font-size: 1rem; padding: 12px 14px; border-radius: 12px; border: 1px solid #cbd5e1; margin: 8px 0; }}
+    .hit {{ display: block; width: 100%; text-align: left; margin: 6px 0; padding: 10px 12px; border-radius: 10px; border: 1px solid #e2e8f0; background: #fff; font-size: 0.95rem; }}
     @media (min-width: 720px) {{ .metrics {{ grid-template-columns: repeat(4, 1fr); }} }}
     @media (max-width: 640px) {{ body {{ margin: 12px auto; }} }}
   </style>
@@ -305,8 +314,17 @@ def write_pages_html(
   <h1>ETF 榜单</h1>
   <p class="meta">更新时刻（上海）：{html.escape(generated_at)} · 行情截止：{html.escape(asof)}{(" · " + html.escape(bar_note)) if bar_note else ""} · 数据源：{html.escape(source)}（东财失败自动切新浪）</p>
   {err_html}
-  {style_html}
-  {body}
+  <nav class="tabs">
+    <button type="button" class="tab on" data-tab="support">支撑位</button>
+    <button type="button" class="tab" data-tab="resist">压力位</button>
+    <button type="button" class="tab" data-tab="style">比价</button>
+    <button type="button" class="tab" data-tab="boards">榜单</button>
+  </nav>
+  <div id="panel-support" class="panel">{support_html}</div>
+  <div id="panel-resist" class="panel" hidden>{resist_html}</div>
+  <div id="panel-style" class="panel" hidden>{style_html}</div>
+  <div id="panel-boards" class="panel" hidden>{body}</div>
+  {levels_script}
 </body>
 </html>
 """
@@ -332,6 +350,22 @@ def main() -> int:
     mom, err = _run_one("动量 TOP30", lambda: get_momentum_top30("510300", 20))
     if err:
         errors["momentum"] = err
+
+    boards_map = {"low_position": low, "reversal": rev, "momentum": mom}
+    print("==> 支撑位 / 压力位", flush=True)
+    try:
+        from scripts.level_page import level_catalog, level_sections
+
+        level_items = level_catalog(boards_map, extra=40)
+        support_html, resist_html, levels_script = level_sections(level_items)
+        print(f"    ok  {len(level_items)} 只", flush=True)
+    except Exception as exc:
+        from scripts.level_page import level_sections
+
+        support_html, resist_html, levels_script = level_sections([])
+        errors["levels"] = str(exc)
+        print(f"    fail  {exc}", flush=True)
+        traceback.print_exc()
 
     print("==> 创业板 ÷ 中证红利低波", flush=True)
     style_html, style_err = _style_section_html()
@@ -359,6 +393,9 @@ def main() -> int:
         source,
         bar_note,
         style_html,
+        support_html,
+        resist_html,
+        levels_script,
     )
     snap = load_boards_snapshot()
     rows = (snap or {}).get("meta", {}).get("rows", {})

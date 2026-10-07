@@ -36,6 +36,13 @@ from analysis.screener import (
     get_momentum_top30,
 )
 from analysis.board_store import load_boards_snapshot, snapshot_caption
+from analysis.style_ratio import (
+    WINDOWS as STYLE_WINDOWS,
+    build_style_ratio,
+    load_chinext_dividend,
+    read_price_volume,
+)
+from analysis.support_levels import analyze_resistances, analyze_supports
 from analysis.low_position_screener import get_low_position_top30
 from analysis.reversal_screener import get_reversal_top30
 from analysis.trade_review import FORWARD_DAYS, evaluate_trade_points, reviews_to_dataframe
@@ -47,6 +54,7 @@ from ui.etfirst_display import render_etfirst_summary
 from ui.sidebar import render_holdings_sidebar
 from ui.styles import inject_global_styles, page_header
 from ui.trade_chart import annotate_all_trade_rows
+from utils import clean_etf_symbol
 
 inject_global_styles()
 pool = render_holdings_sidebar()
@@ -55,7 +63,7 @@ holdings = get_enabled_holdings()
 
 page_header(
     "📊 ETF 持仓分析",
-    "核心结论 · 技术指标 · 比价线 · 数据源 AkShare / ETFirst",
+    "核心结论 · 技术指标 · 支撑位 · 压力位 · 比价线 · 数据源 AkShare / ETFirst",
     asof=data_asof_str(),
 )
 
@@ -116,10 +124,12 @@ if "user_trades" not in st.session_state:
 # st.tabs 在 st.rerun() 后总会回到第一项；用 segmented_control + session_state 记住分区
 TAB_CORE = "🎯 核心结论"
 TAB_DETAIL = "📈 指标详情"
+TAB_SUPPORT = "📍 支撑位"
+TAB_RESIST = "🚧 压力位"
 TAB_TRADES = "📷 交易截图"
 TAB_RATIO = "⚖️ 比价线"
 TAB_ETFIRST = "🏦 ETFirst"
-TAB_OPTIONS = [TAB_CORE, TAB_DETAIL, TAB_TRADES, TAB_RATIO, TAB_ETFIRST]
+TAB_OPTIONS = [TAB_CORE, TAB_DETAIL, TAB_SUPPORT, TAB_RESIST, TAB_TRADES, TAB_RATIO, TAB_ETFIRST]
 
 # 加载榜单过程中 / 刚点加载后，强制留在比价线（须在控件创建前写入）
 if (
@@ -230,6 +240,137 @@ if st.session_state.get("ratio_top30_pending"):
     st.session_state["ratio_top30_pending"] = False
 
 # ── 核心结论 ─────────────────────────────────────────────
+def _render_level_tab(kind: str) -> None:
+    """kind 为 support 或 resist。"""
+    resist = kind == "resist"
+    title = "压力位" if resist else "支撑位"
+    price_key = "压力价" if resist else "支撑价"
+    spent = "已突破" if resist else "已跌破"
+    active_label = "优先压力" if resist else "优先支撑"
+    analyze = analyze_resistances if resist else analyze_supports
+    line_note = (
+        "橙线是还在现价上方或正在测试的压力。绿色虚线是已经站上、现在当支撑看的位置。"
+        if resist
+        else "绿线是还在现价下方或正在测试的支撑。橙色虚线是已经跌破、现在当压力看的位置。"
+    )
+    intro = (
+        "压力按前高、均线、周线、斐波反弹、向下缺口、成交密集和枢轴叠在一起。"
+        if resist
+        else "支撑按前低、均线、周线、斐波回撤、缺口、成交密集和枢轴叠在一起。"
+    )
+    st.caption(
+        f"数据截止日期：**{data_asof_str()}**。{intro}"
+        "靠得太近的合成一档。优先级看离现价远近、是不是多类重合、以前有没有挡住或接住。"
+    )
+    c_query, c_lb = st.columns([3, 1])
+    with c_query:
+        query = st.text_input(
+            "搜索代码、名称或板块",
+            placeholder="如 红利、有色、创业板、510300",
+            key=f"{kind}_query",
+        ).strip()
+    with c_lb:
+        lookback = st.selectbox("统计区间", [120, 250, 500], index=1, key=f"{kind}_lookback")
+
+    options = list(symbols)
+    labels = {code: f"{code} {pool.get(code, '')}" for code in symbols}
+    names = {code: pool.get(code, "") for code in symbols}
+    if query:
+        try:
+            spot = _load_full_spot()
+            mask = (
+                spot["代码"].astype(str).str.contains(query, case=False, regex=False)
+                | spot["名称"].astype(str).str.contains(query, case=False, regex=False)
+                | spot["板块"].astype(str).str.contains(query, case=False, regex=False)
+            )
+            found = spot.loc[mask].head(40)
+            options = found["代码"].astype(str).tolist()
+            labels = {
+                str(row["代码"]): f"{row['代码']} {row['名称']} · {row['板块']}"
+                for _, row in found.iterrows()
+            }
+            names = {str(row["代码"]): str(row["名称"]) for _, row in found.iterrows()}
+        except Exception as exc:
+            st.warning(f"搜索行情名单失败：{str(exc)[:160]}")
+            options = []
+    code = ""
+    if not options:
+        st.info("没有匹配的 ETF。换个关键词，或直接输入 6 位代码。")
+    else:
+        if st.session_state.get(f"{kind}_sym") not in options:
+            st.session_state[f"{kind}_sym"] = options[0]
+        code = st.selectbox(
+            "匹配结果" if query else "持仓标的",
+            options,
+            format_func=lambda item: labels.get(item, item),
+            key=f"{kind}_sym",
+        )
+    if code and st.button(f"计算{title}", type="primary", key=f"btn_{kind}"):
+        st.session_state[f"{kind}_pending"] = True
+        st.session_state[f"{kind}_code"] = code
+        st.session_state[f"{kind}_name"] = names.get(code, "")
+        st.session_state.pop(f"{kind}_result", None)
+    if st.session_state.get(f"{kind}_pending") and f"{kind}_result" not in st.session_state:
+        with st.spinner(f"拉取日线并整理{title}..."):
+            try:
+                picked = st.session_state.get(f"{kind}_code") or code
+                df, source = fetch_etf_daily_cached(picked, tail_days=max(int(lookback) + 30, 520))
+                result = analyze(df, lookback=int(lookback))
+                result["code"] = picked
+                result["name"] = st.session_state.get(f"{kind}_name") or pool.get(picked, "")
+                result["source"] = source
+                result["error"] = None
+            except Exception as exc:
+                result = {"code": code, "error": str(exc)}
+            st.session_state[f"{kind}_result"] = result
+            st.session_state[f"{kind}_pending"] = False
+    result = st.session_state.get(f"{kind}_result")
+    if result and result.get("error"):
+        st.warning(f"计算失败：{result['error'][:240]}")
+    elif result and result.get("zones"):
+        st.success(
+            f"{result['code']} {result.get('name') or ''} · 截止 {result['asof']} · {result.get('source', '')}"
+        )
+        zones = result["zones"]
+        active = next((z for z in zones if z["状态"] != spent), None)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("现价", f"{result['close']:.3f}")
+        m2.metric(active_label, f"{active[price_key]:.3f}" if active else "—")
+        m3.metric("距现价", f"{active['距现价%']:.1f}%" if active else "—")
+        m4.metric("优先级", active["优先级"] if active else "—")
+        st.markdown(result["summary"])
+        st.dataframe(
+            pd.DataFrame(zones)[["顺位", "优先级", "状态", price_key, "距现价%", "测试次数", "构成", "策略"]],
+            hide_index=True,
+            use_container_width=True,
+        )
+        fig = go.Figure()
+        close_line = result["chart_close"]
+        fig.add_trace(go.Scatter(x=close_line.index, y=close_line, name="收盘", line=dict(color="#0f172a", width=2)))
+        fig.add_trace(
+            go.Scatter(x=result["chart_ma20"].index, y=result["chart_ma20"], name="MA20", line=dict(color="#2563eb", width=1, dash="dash"))
+        )
+        fig.add_trace(
+            go.Scatter(x=result["chart_ma60"].index, y=result["chart_ma60"], name="MA60", line=dict(color="#7c3aed", width=1, dash="dot"))
+        )
+        for zone in zones:
+            alive = zone["状态"] != spent
+            color = ("#b45309" if resist else "#0f766e") if alive else ("#0f766e" if resist else "#b45309")
+            fig.add_hline(
+                y=zone[price_key],
+                line_color=color,
+                line_width=1.5 if zone["优先级"] == "高" else 1,
+                line_dash="solid" if alive else "dot",
+                annotation_text=f"{zone[price_key]:.3f} {zone['优先级']}",
+                annotation_position="right",
+                annotation_font_size=11,
+                annotation_font_color=color,
+            )
+        apply_chart_style(fig, height=520, title=f"{result['code']} {title}")
+        st.plotly_chart(fig, use_container_width=True, key=f"{kind}_chart")
+        st.caption(line_note)
+
+
 if active_tab == TAB_CORE:
     st.markdown(
         f"数据截止日期：**{data_asof_str()}**。一键扫描持仓池，输出每支 ETF 的**价均相对位置 / 均线走势 / BIAS / MACD / 近N日涨跌幅**精简结论。"
@@ -525,6 +666,13 @@ elif active_tab == TAB_DETAIL:
         else:
             st.caption("在「交易截图」页保存买卖记录后，此处将自动复盘。")
 
+# ── 支撑位 / 压力位 ─────────────────────────────────────
+elif active_tab == TAB_SUPPORT:
+    _render_level_tab("support")
+
+elif active_tab == TAB_RESIST:
+    _render_level_tab("resist")
+
 # ── 交易截图 ─────────────────────────────────────────────
 elif active_tab == TAB_TRADES:
     st.markdown(
@@ -630,6 +778,149 @@ elif active_tab == TAB_RATIO:
         f"数据截止日期：**{_asof}**。比价线用于发现主线。默认只用**持仓板块**，不自动拉全市场（避免卡顿）。"
         "需要时再点按钮加载 TOP30 / 反转榜 / 低位榜 / 全市场板块。"
     )
+
+    with st.expander("创业板 ÷ 中证红利低波", expanded=True):
+        st.markdown(
+            "比价 = **创业板指（399006）** ÷ **中证红利低波（930955）**。"
+            " **历史分位**按创业板、红利低波、比价三条分别计算："
+            "所选窗口里，价格不高于当日的交易日占比"
+            "（100 表示处在这段区间的最高，0 表示最低）。"
+        )
+        style_win = st.selectbox(
+            "分位窗口",
+            list(STYLE_WINDOWS),
+            index=1,
+            key="style_ratio_window",
+        )
+        if st.button("加载比价与分位", key="btn_style_ratio"):
+            st.session_state["style_ratio_pending"] = True
+            st.session_state.pop("style_ratio_err", None)
+        if st.session_state.get("style_ratio_pending"):
+            with st.spinner("拉取创业板指与中证红利低波（约 10 秒）…"):
+                try:
+                    st.session_state["style_ratio_pair"] = load_chinext_dividend()
+                except Exception as exc:
+                    st.session_state["style_ratio_err"] = str(exc)
+            st.session_state["style_ratio_pending"] = False
+        if st.session_state.get("style_ratio_err"):
+            st.warning(f"加载失败: {str(st.session_state['style_ratio_err'])[:240]}")
+        style_pair = st.session_state.get("style_ratio_pair")
+        if not style_pair:
+            st.info("尚未加载。点 **「加载比价与分位」**。")
+        else:
+            style_view = build_style_ratio(style_pair, STYLE_WINDOWS[style_win], ma_period=20)
+            m1, m2, m3, m4 = st.columns(4)
+            def _pct(value: float | None) -> str:
+                return "—" if value is None else f"{value:.1f}%"
+
+            m1.metric(f"{style_pair['chinext_name']}历史分位", _pct(style_view["chinext_pct"]))
+            m2.metric(f"{style_pair['div_name']}历史分位", _pct(style_view["div_pct"]))
+            last_ratio = style_view["ratio"].iloc[-1]
+            m3.metric("当前比价", f"{float(last_ratio['比价']):.4f}")
+            ratio_pct = style_view["ratio_pct"]
+            m4.metric("比价历史分位", "—" if ratio_pct is None else f"{ratio_pct:.1f}%")
+            note = style_pair.get("note") or ""
+            st.caption(
+                f"行情截止 {style_pair['asof']} · 窗口 {style_win}"
+                f"（创业板 {style_view['chinext_n']} 日 / 红利低波 {style_view['div_n']} 日）"
+                + (f" · {note}" if note else "")
+            )
+            ratio_df = style_view["ratio"]
+            ma_col = f"比价MA{style_view['ma_period']}"
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.65, 0.35])
+            fig.add_trace(
+                go.Scatter(x=ratio_df.index, y=ratio_df["比价"], name="创业板指/红利低波"),
+                row=1,
+                col=1,
+            )
+            fig.add_trace(
+                go.Scatter(x=ratio_df.index, y=ratio_df[ma_col], name=ma_col, line=dict(dash="dash")),
+                row=1,
+                col=1,
+            )
+            fig.add_trace(go.Scatter(x=ratio_df.index, y=ratio_df["比价BIAS"], name="比价BIAS"), row=2, col=1)
+            fig.add_hline(y=0, line_dash="dash", row=2, col=1)
+            apply_chart_style(fig, height=480, title="比价趋势：创业板指 ÷ 中证红利低波")
+            st.plotly_chart(fig, use_container_width=True, key="style_ratio_chart")
+
+            pct_fig = go.Figure()
+            pct_fig.add_trace(
+                go.Scatter(
+                    x=style_view["chinext_pct_path"].index,
+                    y=style_view["chinext_pct_path"],
+                    name="创业板指历史分位",
+                )
+            )
+            pct_fig.add_trace(
+                go.Scatter(
+                    x=style_view["div_pct_path"].index,
+                    y=style_view["div_pct_path"],
+                    name="红利低波历史分位",
+                )
+            )
+            pct_fig.add_trace(
+                go.Scatter(
+                    x=style_view["ratio_pct_path"].index,
+                    y=style_view["ratio_pct_path"],
+                    name="比价历史分位",
+                    line=dict(dash="dot"),
+                )
+            )
+            pct_fig.add_hline(y=80, line_dash="dash", line_color="#94a3b8")
+            pct_fig.add_hline(y=20, line_dash="dash", line_color="#94a3b8")
+            pct_fig.update_yaxes(range=[0, 100], title="分位 %")
+            apply_chart_style(pct_fig, height=420, title="历史分位：创业板指、中证红利低波、比价")
+            st.plotly_chart(pct_fig, use_container_width=True, key="style_pct_chart")
+
+            pv = read_price_volume(style_pair["chinext"], style_pair.get("chinext_volume"))
+            st.markdown(f"**创业板指量价：{pv['label']}**")
+            st.caption(pv["why"])
+            st.caption(
+                "怎么看：均线向下且下跌日量更大，是下跌趋势；"
+                "还在均线下但量能萎缩，只是缩量止跌；"
+                "放量上涨并站上20日均线、均线不再向下，才记为反转尝试。"
+                + (
+                    f" 当日量能 / 20日均量 = {pv['vol_ratio']:.2f}。"
+                    if pv["vol_ratio"] is not None
+                    else " 重新加载后才有量能。"
+                )
+                + (
+                    f" 下跌日均量 / 上涨日均量 = {pv['down_vs_up']:.2f}。"
+                    if pv["down_vs_up"] is not None
+                    else ""
+                )
+            )
+            pv_chart = pv["chart"]
+            pv_fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.68, 0.32])
+            pv_fig.add_trace(go.Scatter(x=pv_chart.index, y=pv_chart["收盘"], name="创业板指"), row=1, col=1)
+            pv_fig.add_trace(
+                go.Scatter(x=pv_chart.index, y=pv_chart["MA20"], name="MA20", line=dict(dash="dash")),
+                row=1,
+                col=1,
+            )
+            pv_fig.add_trace(
+                go.Scatter(x=pv_chart.index, y=pv_chart["MA60"], name="MA60", line=dict(dash="dot")),
+                row=1,
+                col=1,
+            )
+            if "量能" in pv_chart.columns:
+                prev_close = pv_chart["收盘"].shift(1)
+                colors = [
+                    "#dc2626" if pd.notna(c) and pd.notna(p) and c >= p else "#16a34a"
+                    for c, p in zip(pv_chart["收盘"], prev_close)
+                ]
+                pv_fig.add_trace(
+                    go.Bar(x=pv_chart.index, y=pv_chart["量能"], name="量能", marker_color=colors),
+                    row=2,
+                    col=1,
+                )
+                pv_fig.add_trace(
+                    go.Scatter(x=pv_chart.index, y=pv_chart["量能MA20"], name="量能MA20", line=dict(dash="dash")),
+                    row=2,
+                    col=1,
+                )
+            apply_chart_style(pv_fig, height=480, title="创业板指：价格与量能（近120个交易日）")
+            st.plotly_chart(pv_fig, use_container_width=True, key="style_pv_chart")
 
     # 全市场板块：仅按需加载，禁止进 tab 就请求东财现货（会卡死页面）
     if "ratio_market_map" not in st.session_state:
