@@ -67,9 +67,6 @@ def _channel(close: pd.Series, high: pd.Series, low: pd.Series, window: int = 60
     last = float(y[-1])
     if last <= 0 or upper_now <= lower_now:
         return None
-    width = (upper_now - lower_now) / last
-    if width > 0.4:
-        return None
     slope_20 = float(slope * 20 / last * 100)
     if slope_20 > 0.6:
         direction = "上升"
