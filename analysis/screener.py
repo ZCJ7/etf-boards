@@ -304,7 +304,7 @@ def _load_full_spot_asof(asof: str) -> pd.DataFrame:
     raise RuntimeError(f"ETF 现货拉取失败（{last_err}），请稍后重试")
 
 
-def _spot_to_pool(spot: pd.DataFrame) -> pd.DataFrame:
+def _spot_to_pool(spot: pd.DataFrame, drop_excluded: bool = True) -> pd.DataFrame:
     if spot is None or spot.empty:
         raise RuntimeError("现货为空")
 
@@ -338,7 +338,7 @@ def _spot_to_pool(spot: pd.DataFrame) -> pd.DataFrame:
         _save_turnover_cache(work[code_col], live_amt)
         rank = live_amt
     work["_rank"] = pd.to_numeric(rank, errors="coerce")
-    if name_col and name_col in work.columns:
+    if drop_excluded and name_col and name_col in work.columns:
         work = work[~work[name_col].astype(str).str.contains(_EXCLUDE_NAME, na=False)]
     work = work.dropna(subset=["_rank"])
     if work.empty:
@@ -361,6 +361,30 @@ def _spot_to_pool(spot: pd.DataFrame) -> pd.DataFrame:
 def _load_full_spot() -> pd.DataFrame:
     """按当前数据截止日取现货；截止日变化时自动换缓存。"""
     return _load_full_spot_asof(data_asof_str())
+
+
+def load_etf_universe() -> pd.DataFrame:
+    """支撑/压力搜索用的全部场内 ETF，保留宽基和跨境。"""
+    sources: list[tuple[str, callable, float]] = [
+        ("eastmoney", _fetch_spot_eastmoney, 12),
+        ("sina", _fetch_spot_sina, 12),
+        ("ths", _fetch_spot_ths, 10),
+    ]
+    if hist_prefer_sina():
+        sources = [
+            ("sina", _fetch_spot_sina, 12),
+            ("ths", _fetch_spot_ths, 10),
+            ("eastmoney", _fetch_spot_eastmoney, 8),
+        ]
+    for _name, fn, timeout in sources:
+        spot = _call_spot(fn, timeout)
+        try:
+            out = _spot_to_pool(spot, drop_excluded=False)
+        except Exception:
+            continue
+        if out is not None and not out.empty:
+            return out
+    return _load_full_spot()
 
 
 _load_full_spot.clear = _load_full_spot_asof.clear  # type: ignore[method-assign]

@@ -6,7 +6,7 @@ import json
 
 import pandas as pd
 
-from analysis.screener import _load_full_spot
+from analysis.screener import load_etf_universe
 from analysis.support_levels import analyze_resistances, analyze_supports
 from etf_data_fetcher import fetch_pool_daily
 from utils import clean_etf_symbol
@@ -32,7 +32,7 @@ def board_codes(boards: dict) -> list[str]:
 
 def level_catalog(boards: dict, extra: int | None = None) -> list[dict]:
     """榜单 ETF 全部保留。extra 为空时再补上全市场其余 ETF。"""
-    spot = _load_full_spot()
+    spot = load_etf_universe()
     names: dict[str, str] = {}
     sectors: dict[str, str] = {}
     ranked: list[str] = []
