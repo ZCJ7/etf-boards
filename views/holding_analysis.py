@@ -353,7 +353,30 @@ def _render_level_tab(kind: str) -> None:
         fig.add_trace(
             go.Scatter(x=result["chart_ma60"].index, y=result["chart_ma60"], name="MA60", line=dict(color="#7c3aed", width=1, dash="dot"))
         )
+        channel = result.get("channel") or {}
+        lower_line = channel.get("lower_line")
+        upper_line = channel.get("upper_line")
+        if lower_line is not None and upper_line is not None:
+            direction = channel.get("direction") or ""
+            fig.add_trace(
+                go.Scatter(
+                    x=lower_line.index,
+                    y=lower_line,
+                    name=f"{direction}通道下轨",
+                    line=dict(color="#0f766e", width=2),
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=upper_line.index,
+                    y=upper_line,
+                    name=f"{direction}通道上轨",
+                    line=dict(color="#b45309", width=2),
+                )
+            )
         for zone in zones:
+            if "通道" in zone["构成"] and "+" not in zone["构成"]:
+                continue
             alive = zone["状态"] != spent
             color = ("#b45309" if resist else "#0f766e") if alive else ("#0f766e" if resist else "#b45309")
             fig.add_hline(
@@ -368,7 +391,7 @@ def _render_level_tab(kind: str) -> None:
             )
         apply_chart_style(fig, height=520, title=f"{result['code']} {title}")
         st.plotly_chart(fig, use_container_width=True, key=f"{kind}_chart")
-        st.caption(line_note + " 通道线是斜的，表里的价格是这条线画到最新交易日的位置。")
+        st.caption(line_note + " 图上的斜线是近60日通道，绿线是下轨，橙线是上轨。")
 
 
 if active_tab == TAB_CORE:

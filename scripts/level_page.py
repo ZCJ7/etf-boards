@@ -91,7 +91,8 @@ def level_catalog(boards: dict, extra: int | None = None) -> list[dict]:
         if support is None and resist is None:
             continue
         base = support or resist
-        spark = base["chart_close"].tail(40)
+        spark = base["chart_close"].tail(60)
+        channel = _channel_payload(base.get("channel"), spark.index)
         items.append(
             {
                 "code": code,
@@ -103,9 +104,29 @@ def level_catalog(boards: dict, extra: int | None = None) -> list[dict]:
                 "support": {"summary": (support or {}).get("summary", ""), "zones": (support or {}).get("zones", [])},
                 "resist": {"summary": (resist or {}).get("summary", ""), "zones": (resist or {}).get("zones", [])},
                 "spark": [round(float(v), 4) for v in spark.tolist()],
+                "channel": channel,
             }
         )
     return items
+
+
+def _channel_payload(channel: dict | None, index: pd.Index) -> dict | None:
+    if not channel:
+        return None
+    lower = channel["lower_line"].reindex(index)
+    upper = channel["upper_line"].reindex(index)
+    if int(lower.notna().sum()) < 2 or int(upper.notna().sum()) < 2:
+        return None
+
+    def _nums(series: pd.Series) -> list[float | None]:
+        return [None if pd.isna(v) else round(float(v), 4) for v in series.tolist()]
+
+    return {
+        "direction": channel["direction"],
+        "slope_20": round(float(channel["slope_20"]), 1),
+        "lower": _nums(lower),
+        "upper": _nums(upper),
+    }
 
 
 def levels_payload(items: list[dict]) -> str:
@@ -115,7 +136,7 @@ def levels_payload(items: list[dict]) -> str:
 def level_sections(items: list[dict]) -> tuple[str, str, str]:
     note = (
         f"可以搜全部场内 ETF，当前 {len(items)} 只。"
-        "斜向的一档是近60日通道线，表里的价格是这条线画到最新交易日的位置。"
+        "图里的斜线是近60日通道，绿线是下轨，橙线是上轨。"
     )
     support = _panel(
         "support",
@@ -158,11 +179,35 @@ _SCRIPT = r"""
   function metric(label, value) {
     return "<div class='metric'><span>" + esc(label) + "</span><b>" + esc(String(value)) + "</b></div>";
   }
+  function yOf(v, min, max, top, ph) {
+    return top + (1 - (v - min) / (max - min)) * ph;
+  }
+  function rail(vals, ys, min, max, left, top, pw, ph, color, name) {
+    if (!vals || vals.length !== ys.length) return "";
+    var pts = [];
+    vals.forEach(function(v, i) {
+      if (v == null || isNaN(v)) return;
+      var x = left + (i / (ys.length - 1)) * pw;
+      pts.push(x.toFixed(1) + "," + yOf(v, min, max, top, ph).toFixed(1));
+    });
+    if (pts.length < 2) return "";
+    var last = pts[pts.length - 1].split(",");
+    return "<polyline fill='none' stroke='" + color + "' stroke-width='2.2' points='" + pts.join(" ") + "'/>"
+      + "<text x='" + (Number(last[0]) - 6) + "' y='" + (Number(last[1]) - 4) + "' text-anchor='end' font-size='12' fill='" + color + "'>" + name + "</text>";
+  }
   function chart(item, side, zones) {
     var ys = item.spark || [];
     if (ys.length < 2) return "";
+    var ch = item.channel || {};
+    var extra = (ch.lower || []).concat(ch.upper || []);
     var min = Math.min.apply(null, ys), max = Math.max.apply(null, ys);
+    extra.forEach(function(v) {
+      if (v == null || isNaN(v)) return;
+      if (v < min) min = v;
+      if (v > max) max = v;
+    });
     zones.forEach(function(z) {
+      if (String(z["构成"] || "").indexOf("通道") >= 0 && String(z["构成"]).indexOf("+") < 0) return;
       var y = Number(z[side.price]);
       if (y < min) min = y;
       if (y > max) max = y;
@@ -173,17 +218,19 @@ _SCRIPT = r"""
     var w = 720, h = 220, left = 8, top = 12, pw = 704, ph = 196;
     var pts = ys.map(function(v, i) {
       var x = left + (i / (ys.length - 1)) * pw;
-      var y = top + (1 - (v - min) / (max - min)) * ph;
-      return x.toFixed(1) + "," + y.toFixed(1);
+      return x.toFixed(1) + "," + yOf(v, min, max, top, ph).toFixed(1);
     }).join(" ");
     var lines = zones.map(function(z) {
-      var y = top + (1 - (Number(z[side.price]) - min) / (max - min)) * ph;
+      if (String(z["构成"] || "").indexOf("通道") >= 0 && String(z["构成"]).indexOf("+") < 0) return "";
+      var y = yOf(Number(z[side.price]), min, max, top, ph);
       var alive = z["状态"] !== side.spent;
       var color = alive ? side.alive : side.dead;
       var dash = alive ? "" : " stroke-dasharray='4 3'";
-      return "<line x1='" + left + "' y1='" + y.toFixed(1) + "' x2='" + (left + pw) + "' y2='" + y.toFixed(1) + "' stroke='" + color + "' stroke-width='1.4'" + dash + "/>";
+      return "<line x1='" + left + "' y1='" + y.toFixed(1) + "' x2='" + (left + pw) + "' y2='" + y.toFixed(1) + "' stroke='" + color + "' stroke-width='1.2'" + dash + "/>";
     }).join("");
-    return "<div class='chartbox'><svg viewBox='0 0 " + w + " " + h + "' class='chart'><rect x='" + left + "' y='" + top + "' width='" + pw + "' height='" + ph + "' class='plot'/>" + lines + "<polyline fill='none' stroke='#0f172a' stroke-width='2' points='" + pts + "'/></svg></div>";
+    var rails = rail(ch.lower, ys, min, max, left, top, pw, ph, "#0f766e", (ch.direction || "") + "通道下轨")
+      + rail(ch.upper, ys, min, max, left, top, pw, ph, "#b45309", (ch.direction || "") + "通道上轨");
+    return "<div class='chartbox'><svg viewBox='0 0 " + w + " " + h + "' class='chart'><rect x='" + left + "' y='" + top + "' width='" + pw + "' height='" + ph + "' class='plot'/>" + lines + rails + "<polyline fill='none' stroke='#0f172a' stroke-width='2' points='" + pts + "'/></svg></div>";
   }
   function render(item, side) {
     var pack = item[side.box] || {summary: "", zones: []};

@@ -58,8 +58,12 @@ def _channel(close: pd.Series, high: pd.Series, low: pd.Series, window: int = 60
     y = c.to_numpy(dtype=float)
     slope, intercept = np.polyfit(x, y, 1)
     line = intercept + slope * x
-    upper_now = float(line[-1] + np.nanmax(h.to_numpy(dtype=float) - line))
-    lower_now = float(line[-1] + np.nanmin(l.to_numpy(dtype=float) - line))
+    upper_off = float(np.nanmax(h.to_numpy(dtype=float) - line))
+    lower_off = float(np.nanmin(l.to_numpy(dtype=float) - line))
+    upper_line = pd.Series(line + upper_off, index=c.index)
+    lower_line = pd.Series(line + lower_off, index=c.index)
+    upper_now = float(upper_line.iloc[-1])
+    lower_now = float(lower_line.iloc[-1])
     last = float(y[-1])
     if last <= 0 or upper_now <= lower_now:
         return None
@@ -78,6 +82,8 @@ def _channel(close: pd.Series, high: pd.Series, low: pd.Series, window: int = 60
         "upper": upper_now,
         "direction": direction,
         "slope_20": slope_20,
+        "upper_line": upper_line,
+        "lower_line": lower_line,
     }
 
 
@@ -369,6 +375,7 @@ def analyze_supports(df: pd.DataFrame, lookback: int = 250) -> dict:
         "chart_close": chart,
         "chart_ma20": ma20,
         "chart_ma60": ma60,
+        "channel": channel,
     }
 
 
@@ -664,4 +671,5 @@ def analyze_resistances(df: pd.DataFrame, lookback: int = 250) -> dict:
         "chart_close": chart,
         "chart_ma20": close.rolling(20).mean().reindex(chart.index),
         "chart_ma60": close.rolling(60).mean().reindex(chart.index),
+        "channel": channel,
     }
