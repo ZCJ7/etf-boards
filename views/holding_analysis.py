@@ -254,9 +254,9 @@ def _render_level_tab(kind: str) -> None:
         else "绿线是还在现价下方或正在测试的支撑。橙色虚线是已经跌破、现在当压力看的位置。"
     )
     intro = (
-        "压力按前高、均线、周线、斐波反弹、向下缺口、成交密集和枢轴叠在一起。"
+        "压力按前高、均线、周线、斐波反弹、向下缺口、成交密集、枢轴，以及近60日通道上轨叠在一起。"
         if resist
-        else "支撑按前低、均线、周线、斐波回撤、缺口、成交密集和枢轴叠在一起。"
+        else "支撑按前低、均线、周线、斐波回撤、缺口、成交密集、枢轴，以及近60日通道下轨叠在一起。"
     )
     st.caption(
         f"数据截止日期：**{data_asof_str()}**。{intro}"
@@ -368,7 +368,7 @@ def _render_level_tab(kind: str) -> None:
             )
         apply_chart_style(fig, height=520, title=f"{result['code']} {title}")
         st.plotly_chart(fig, use_container_width=True, key=f"{kind}_chart")
-        st.caption(line_note)
+        st.caption(line_note + " 通道线是斜的，表里的价格是这条线画到最新交易日的位置。")
 
 
 if active_tab == TAB_CORE:

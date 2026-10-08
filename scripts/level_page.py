@@ -1,4 +1,4 @@
-"""手机页的支撑位 / 压力位：榜单 ETF + 成交靠前的补充。"""
+"""手机页的支撑位 / 压力位：全部场内 ETF。"""
 
 from __future__ import annotations
 
@@ -30,8 +30,8 @@ def board_codes(boards: dict) -> list[str]:
     return found
 
 
-def level_catalog(boards: dict, extra: int = 40) -> list[dict]:
-    """先放榜单里的 ETF，再按成交额补一批。支撑和压力一起算。"""
+def level_catalog(boards: dict, extra: int | None = None) -> list[dict]:
+    """榜单 ETF 全部保留。extra 为空时再补上全市场其余 ETF。"""
     spot = _load_full_spot()
     names: dict[str, str] = {}
     sectors: dict[str, str] = {}
@@ -68,11 +68,12 @@ def level_catalog(boards: dict, extra: int = 40) -> list[dict]:
         chosen.append(code)
         seen.add(code)
         added += 1
-        if added >= extra:
+        if extra is not None and added >= extra:
             break
 
     if not chosen:
         return []
+    print(f"    名单 {len(chosen)} 只", flush=True)
     daily = fetch_pool_daily(chosen, tail_days=520, max_workers=8, pause_sec=0)
     items: list[dict] = []
     for code in chosen:
@@ -90,7 +91,7 @@ def level_catalog(boards: dict, extra: int = 40) -> list[dict]:
         if support is None and resist is None:
             continue
         base = support or resist
-        spark = base["chart_close"].tail(60)
+        spark = base["chart_close"].tail(40)
         items.append(
             {
                 "code": code,
@@ -107,10 +108,15 @@ def level_catalog(boards: dict, extra: int = 40) -> list[dict]:
     return items
 
 
+def levels_payload(items: list[dict]) -> str:
+    return json.dumps(items, ensure_ascii=False)
+
+
 def level_sections(items: list[dict]) -> tuple[str, str, str]:
-    payload = json.dumps(items, ensure_ascii=False).replace("<", "\\u003c")
-    board_n = sum(1 for item in items if item.get("on_board"))
-    note = f"名单里有榜单 ETF {board_n} 只，其余是成交额靠前的补充，一共 {len(items)} 只。"
+    note = (
+        f"可以搜全部场内 ETF，当前 {len(items)} 只。"
+        "斜向的一档是近60日通道线，表里的价格是这条线画到最新交易日的位置。"
+    )
     support = _panel(
         "support",
         "支撑位",
@@ -121,8 +127,7 @@ def level_sections(items: list[dict]) -> tuple[str, str, str]:
         "压力位",
         "按代码、名称或板块搜索。橙线仍是压力，绿线是已经站上、改当支撑的位置。" + note,
     )
-    script = _SCRIPT.replace("__DATA__", payload).replace("__COUNT__", str(len(items)))
-    return support, resist, script
+    return support, resist, _SCRIPT
 
 
 def _panel(kind: str, title: str, note: str) -> str:
@@ -138,10 +143,9 @@ def _panel(kind: str, title: str, note: str) -> str:
 
 
 _SCRIPT = r"""
-<script type="application/json" id="level-data">__DATA__</script>
 <script>
 (function() {
-  var data = JSON.parse(document.getElementById("level-data").textContent || "[]");
+  var data = [];
   var sides = {
     support: {box: "support", price: "支撑价", label: "优先支撑", spent: "已跌破", alive: "#0f766e", dead: "#b45309"},
     resist: {box: "resist", price: "压力价", label: "优先压力", spent: "已突破", alive: "#b45309", dead: "#0f766e"}
@@ -192,7 +196,7 @@ _SCRIPT = r"""
         + "%</td><td>" + z["测试次数"] + "</td><td>" + esc(z["构成"]) + "</td><td>" + esc(z["策略"]) + "</td></tr>";
     }).join("");
     document.getElementById(side.box + "Detail").innerHTML = "<h3>" + esc(item.code + " " + item.name) + "</h3>"
-      + "<p class='note'>行情截止 " + esc(item.asof) + (item.on_board ? " · 在当前榜单里" : " · 成交靠前补充") + "</p>"
+      + "<p class='note'>行情截止 " + esc(item.asof) + (item.on_board ? " · 在当前榜单里" : "") + "</p>"
       + "<div class='metrics'>"
       + metric("现价", Number(item.close).toFixed(3))
       + metric(side.label, active ? Number(active[side.price]).toFixed(3) : "—")
@@ -212,14 +216,14 @@ _SCRIPT = r"""
       list.innerHTML = "";
       document.getElementById(kind + "Detail").innerHTML = "";
       if (!q) {
-        list.innerHTML = "<p class='note'>输入代码、名称或板块，例如 红利、有色、510300。榜单里的 ETF 都在，另外补了成交靠前的。</p>";
+        list.innerHTML = "<p class='note'>输入代码、名称或板块，例如 红利、有色、510300。名单是全部场内 ETF。</p>";
         return;
       }
       var hits = data.filter(function(item) {
         return (item.code + " " + item.name + " " + item.sector).toLowerCase().indexOf(q) >= 0;
       }).slice(0, 30);
       if (!hits.length) {
-        list.innerHTML = "<p class='note'>没有匹配的 ETF。当前名单 " + data.length + " 只，含榜单和成交靠前的补充。</p>";
+        list.innerHTML = "<p class='note'>没有匹配的 ETF。当前名单 " + data.length + " 只。</p>";
         return;
       }
       hits.forEach(function(item) {
@@ -234,8 +238,16 @@ _SCRIPT = r"""
     input.addEventListener("input", show);
     show();
   }
-  bind("support");
-  bind("resist");
+  fetch("levels.json").then(function(r) { return r.json(); }).then(function(rows) {
+    data = rows || [];
+    bind("support");
+    bind("resist");
+  }).catch(function() {
+    ["support", "resist"].forEach(function(kind) {
+      var list = document.getElementById(kind + "Hits");
+      if (list) list.innerHTML = "<p class='note'>名单加载失败，请刷新页面。</p>";
+    });
+  });
   document.querySelectorAll(".tab").forEach(function(btn) {
     btn.addEventListener("click", function() {
       document.querySelectorAll(".tab").forEach(function(other) { other.classList.toggle("on", other === btn); });

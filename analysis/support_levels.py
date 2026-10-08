@@ -45,7 +45,52 @@ def _touch_count(low: pd.Series, close: pd.Series, price: float, band: float = 0
     return touches
 
 
+def _channel(close: pd.Series, high: pd.Series, low: pd.Series, window: int = 60) -> dict | None:
+    """近 N 日收盘的回归通道。下轨、上轨是斜线画到最新一根 K 的价格。"""
+    import numpy as np
+
+    c = close.tail(window).dropna()
+    if len(c) < 30:
+        return None
+    h = high.reindex(c.index)
+    l = low.reindex(c.index)
+    x = np.arange(len(c), dtype=float)
+    y = c.to_numpy(dtype=float)
+    slope, intercept = np.polyfit(x, y, 1)
+    line = intercept + slope * x
+    upper_now = float(line[-1] + np.nanmax(h.to_numpy(dtype=float) - line))
+    lower_now = float(line[-1] + np.nanmin(l.to_numpy(dtype=float) - line))
+    last = float(y[-1])
+    if last <= 0 or upper_now <= lower_now:
+        return None
+    width = (upper_now - lower_now) / last
+    if width > 0.4:
+        return None
+    slope_20 = float(slope * 20 / last * 100)
+    if slope_20 > 0.6:
+        direction = "上升"
+    elif slope_20 < -0.6:
+        direction = "下降"
+    else:
+        direction = "横盘"
+    return {
+        "lower": lower_now,
+        "upper": upper_now,
+        "direction": direction,
+        "slope_20": slope_20,
+    }
+
+
 def _strategy(status: str, kinds: str, dist: float, touches: int) -> str:
+    if "通道下轨" in kinds:
+        piled = "这一档还和别的支撑叠在一起。" if " + " in kinds else ""
+        if status == "已跌破":
+            return "通道下轨已经被收盘跌破，这条斜向支撑失效。反抽到下轨附近看成压力。" + piled
+        if "下降" in kinds:
+            return "这是下降通道的下轨，斜线还在往下走。守住只是下跌途中的暂歇，收盘跌破会走得更快。" + piled
+        if "上升" in kinds:
+            return "这是上升通道的下轨。回踩到这里、收盘守住，才是顺着通道的位置；跌破下轨，这段上升通道就坏了。" + piled
+        return "这是横盘通道的下轨。收盘守住可以看反弹；跌破就离开这个通道。" + piled
     weekly = "周" in kinds or "年线" in kinds or "MA250" in kinds or "MA120" in kinds
     dense = "成交密集" in kinds
     gap = "缺口" in kinds
@@ -232,6 +277,14 @@ def analyze_supports(df: pd.DataFrame, lookback: int = 250) -> dict:
     except Exception:
         pass
 
+    channel = _channel(close, high, low)
+    if channel:
+        add(
+            channel["lower"],
+            f"{channel['direction']}通道下轨({channel['slope_20']:+.1f}%/20日)",
+            4.3,
+        )
+
     if not raw:
         raise RuntimeError("没有算出支撑位")
 
@@ -284,6 +337,7 @@ def analyze_supports(df: pd.DataFrame, lookback: int = 250) -> dict:
             prox = 0.45
         touches = _touch_count(recent_low, recent_close, price)
         kinds = list(dict.fromkeys(bucket["kinds"]))
+        kinds = [k for k in kinds if "通道" in k] + [k for k in kinds if "通道" not in k]
         score = (bucket["weight"] + min(touches, 4) * 1.15) * prox
         zones.append(
             {
@@ -348,6 +402,15 @@ def _reject_count(high: pd.Series, close: pd.Series, price: float, band: float =
 
 
 def _resist_strategy(status: str, kinds: str, dist: float, touches: int) -> str:
+    if "通道上轨" in kinds:
+        piled = "这一档还和别的压力叠在一起。" if " + " in kinds else ""
+        if status == "已突破":
+            return "通道上轨已经被收盘站上，这条斜向压力失效。跌回上轨附近改看支撑。" + piled
+        if "下降" in kinds:
+            return "这是下降通道的上轨。反弹到这里更容易被压回去，收盘站上才算脱离这段下降通道。" + piled
+        if "上升" in kinds:
+            return "这是上升通道的上轨。顺着通道可以靠近，但到上轨不追；站上上轨，通道就往上打开了。" + piled
+        return "这是横盘通道的上轨。靠近不追，收盘站上才离开这个通道。" + piled
     weekly = "周" in kinds or "年线" in kinds or "MA250" in kinds or "MA120" in kinds
     dense = "成交密集" in kinds
     gap = "缺口" in kinds
@@ -511,6 +574,14 @@ def analyze_resistances(df: pd.DataFrame, lookback: int = 250) -> dict:
     except Exception:
         pass
 
+    channel = _channel(close, high, low)
+    if channel:
+        add(
+            channel["upper"],
+            f"{channel['direction']}通道上轨({channel['slope_20']:+.1f}%/20日)",
+            4.3,
+        )
+
     if not raw:
         raise RuntimeError("没有算出压力位")
 
@@ -563,6 +634,7 @@ def analyze_resistances(df: pd.DataFrame, lookback: int = 250) -> dict:
             prox = 0.45
         touches = _reject_count(recent_high, recent_close, price)
         kinds = list(dict.fromkeys(bucket["kinds"]))
+        kinds = [k for k in kinds if "通道" in k] + [k for k in kinds if "通道" not in k]
         score = (bucket["weight"] + min(touches, 4) * 1.15) * prox
         zones.append(
             {

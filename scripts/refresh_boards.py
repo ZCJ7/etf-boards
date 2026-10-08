@@ -257,6 +257,7 @@ def write_pages_html(
     support_html: str = "",
     resist_html: str = "",
     levels_script: str = "",
+    levels_json: str = "",
 ) -> None:
     docs = ROOT / "docs"
     docs.mkdir(parents=True, exist_ok=True)
@@ -330,6 +331,9 @@ def write_pages_html(
 """
     (docs / "index.html").write_text(page, encoding="utf-8")
     (BOARD_DIR / "index.html").write_text(page, encoding="utf-8")
+    if levels_json:
+        (docs / "levels.json").write_text(levels_json, encoding="utf-8")
+        (BOARD_DIR / "levels.json").write_text(levels_json, encoding="utf-8")
 
 
 def main() -> int:
@@ -353,11 +357,13 @@ def main() -> int:
 
     boards_map = {"low_position": low, "reversal": rev, "momentum": mom}
     print("==> 支撑位 / 压力位", flush=True)
+    levels_json = ""
     try:
         from scripts.level_page import level_catalog, level_sections
 
-        level_items = level_catalog(boards_map, extra=40)
+        level_items = level_catalog(boards_map)
         support_html, resist_html, levels_script = level_sections(level_items)
+        levels_json = json.dumps(level_items, ensure_ascii=False)
         print(f"    ok  {len(level_items)} 只", flush=True)
     except Exception as exc:
         from scripts.level_page import level_sections
@@ -396,6 +402,7 @@ def main() -> int:
         support_html,
         resist_html,
         levels_script,
+        levels_json,
     )
     snap = load_boards_snapshot()
     rows = (snap or {}).get("meta", {}).get("rows", {})
