@@ -13,7 +13,7 @@ INDEX = ROOT / "docs" / "index.html"
 
 def _rows(items: list[dict]) -> str:
     if not items:
-        return "<tr><td colspan='6'>无</td></tr>"
+        return "<tr><td colspan='7'>无</td></tr>"
     body = []
     for r in items:
         body.append(
@@ -25,6 +25,36 @@ def _rows(items: list[dict]) -> str:
             "</tr>"
         )
     return "".join(body)
+
+
+def _flow_rows(flow: dict) -> str:
+    if not flow.get("ok"):
+        return "<tr><td colspan='4'>行业资金流没取到</td></tr>"
+    left = flow.get("outflow") or []
+    right = flow.get("inflow") or []
+    rows = []
+    for i in range(max(len(left), len(right))):
+        a = left[i] if i < len(left) else {"行业": "", "净额": ""}
+        b = right[i] if i < len(right) else {"行业": "", "净额": ""}
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(a['行业']))}</td><td>{a['净额']}</td>"
+            f"<td>{html.escape(str(b['行业']))}</td><td>{b['净额']}</td>"
+            "</tr>"
+        )
+    return "".join(rows) or "<tr><td colspan='4'>无</td></tr>"
+
+
+def _reduce_rows(items: list[dict]) -> str:
+    if not items:
+        return "<tr><td colspan='4'>无</td></tr>"
+    return "".join(
+        "<tr>"
+        f"<td>{html.escape(r['名称'])}</td><td>{html.escape(r['股东'])}</td>"
+        f"<td>{r['金额亿']}</td><td>{html.escape(r['公告日'])}</td>"
+        "</tr>"
+        for r in items
+    )
 
 
 def render_cash_section(result: dict | None = None) -> str:
@@ -41,10 +71,15 @@ def render_cash_section(result: dict | None = None) -> str:
     return f"""
 <section id='cash'>
   <h2>仓位与题材</h2>
-  <p class='note'>空仓不是清光全市场。至少估值和技术两层同时报警，才降低仓位或从成长迁走。资金流、两融、减持、美债未接入，不参与打分。</p>
+  <p class='note'>空仓不是清光全市场。估值、资金、技术、外部至少两层同时报警，才降低仓位或从成长迁走。取不到的层标为缺失，不参与打分。</p>
   <div class='metrics'><div class='metric'><span>当前判断</span><b>{html.escape(result['regime'])}</b></div></div>
   <p>{html.escape(result['summary'])}</p>
   <div class='wrap'><table><thead><tr><th>层</th><th>状态</th><th>说明</th></tr></thead><tbody>{layers}</tbody></table></div>
+  <h3>当日行业资金（亿元）</h3>
+  <p class='note'>同花顺口径。左边是净流出最多的行业，右边是净流入最多的行业。单日流向只看钱往哪边走。</p>
+  <div class='wrap'><table><thead><tr><th>净流出</th><th>净额</th><th>净流入</th><th>净额</th></tr></thead><tbody>{_flow_rows(result.get('flow') or {})}</tbody></table></div>
+  <h3>近30日减持金额靠前</h3>
+  <div class='wrap'><table><thead><tr><th>名称</th><th>股东</th><th>估算金额（亿元）</th><th>公告日</th></tr></thead><tbody>{_reduce_rows(result.get('reduction_top') or [])}</tbody></table></div>
   <h3>指数滚动市盈率分位</h3>
   <div class='wrap'><table><thead><tr><th>指数</th><th>市盈率</th><th>历史分位%</th><th>截止</th></tr></thead><tbody>{pe_rows}</tbody></table></div>
   <h3>现在可以看</h3>

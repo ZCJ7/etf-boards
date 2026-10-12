@@ -1,13 +1,12 @@
 """空仓时机与板块迁移。
 
-规则来自公开讨论的四层框架，这里只落地能取到的两层，避免编造：
-- 估值层：乐咕指数滚动市盈率的历史分位（月频）
-- 技术层：对应 ETF 是否跌破 MA20
+四层里至少两层同时报警，才降低仓位或从成长迁走。单一指标只提示。
+- 估值：乐咕指数滚动市盈率的历史分位（月频）
+- 资金：两融融资余额近 5 日变化；近 30 日已公告股东减持估算；同花顺行业资金流只作迁仓参考
+- 技术：对应 ETF 是否跌破向下的 MA20
+- 外部：美国 10 年期国债收益率
 
-至少两层同时报警才给出空仓/减仓结论。单一指标只提示。
-资金流向、两融、产业减持、美债目前接口不稳定或未接入，页面上标为缺失，不参与打分。
-
-板块选择：空仓信号不是清光全市场，而是从贵且走弱的方向，迁到便宜或还站上均线的方向。
+取不到或过期的层标为缺失，不参与打分。减持金额是已公告变动股数乘收盘价，不是减持计划上限。
 """
 
 from __future__ import annotations
@@ -64,6 +63,22 @@ GROWTH_TAGS = {"成长"}
 HOT_PCT = 85.0
 CHEAP_PCT = 50.0
 BROAD_HOT_PCT = 90.0
+US_YIELD_ALARM = 4.5
+US_YIELD_SEVERE = 5.0
+REDUCTION_ALARM_YI = 1000.0
+MARGIN_DOWN_DAYS = 4
+STALE_DAYS = 8
+GROWTH_INDUSTRIES = (
+    "半导体",
+    "元件",
+    "光学光电子",
+    "消费电子",
+    "通信设备",
+    "计算机设备",
+    "软件开发",
+    "互联网服务",
+    "军工电子",
+)
 
 
 def _percentile(series: pd.Series) -> float | None:
@@ -124,6 +139,185 @@ def _ma_state(close: pd.Series) -> dict:
     }
 
 
+def _stale(date_value) -> bool:
+    ts = pd.Timestamp(date_value).normalize()
+    return (pd.Timestamp.today().normalize() - ts).days > STALE_DAYS
+
+
+def load_margin() -> dict:
+    """东方财富两融账户统计，融资余额单位为亿元。"""
+    try:
+        raw = _call(ak.stock_margin_account_info, timeout=25)
+    except Exception as exc:
+        return {"ok": False, "alarm": False, "error": str(exc)[:160]}
+    if raw is None or raw.empty or "融资余额" not in raw.columns:
+        return {"ok": False, "alarm": False, "error": "无融资余额"}
+    work = raw.copy()
+    work["日期"] = pd.to_datetime(work["日期"], errors="coerce")
+    work["融资余额"] = pd.to_numeric(work["融资余额"], errors="coerce")
+    work = work.dropna(subset=["日期", "融资余额"]).sort_values("日期")
+    if len(work) < 8:
+        return {"ok": False, "alarm": False, "error": "融资余额样本不足"}
+    last_dt = work["日期"].iloc[-1]
+    if _stale(last_dt):
+        return {"ok": False, "alarm": False, "error": f"融资余额停在 {last_dt.strftime('%Y-%m-%d')}"}
+    bal = work["融资余额"]
+    last = float(bal.iloc[-1])
+    prev = float(bal.iloc[-6])
+    daily = bal.diff().iloc[-5:]
+    down_days = int((daily < 0).sum())
+    chg = last - prev
+    alarm = chg < 0 and down_days >= MARGIN_DOWN_DAYS
+    return {
+        "ok": True,
+        "alarm": alarm,
+        "balance": round(last, 2),
+        "chg5": round(chg, 2),
+        "pct5": round((last / prev - 1) * 100, 2),
+        "down_days": down_days,
+        "asof": last_dt.strftime("%Y-%m-%d"),
+        "error": "",
+    }
+
+
+def load_us_yield() -> dict:
+    try:
+        raw = _call(lambda: ak.bond_zh_us_rate(start_date="20240101"), timeout=25)
+    except Exception as exc:
+        return {"ok": False, "alarm": False, "error": str(exc)[:160]}
+    if raw is None or raw.empty or "美国国债收益率10年" not in raw.columns:
+        return {"ok": False, "alarm": False, "error": "无美国10年期收益率"}
+    work = raw.copy()
+    work["日期"] = pd.to_datetime(work["日期"], errors="coerce")
+    work["收益率"] = pd.to_numeric(work["美国国债收益率10年"], errors="coerce")
+    work = work.dropna(subset=["日期", "收益率"]).sort_values("日期")
+    if work.empty:
+        return {"ok": False, "alarm": False, "error": "美国10年期收益率为空"}
+    last_dt = work["日期"].iloc[-1]
+    if _stale(last_dt):
+        return {"ok": False, "alarm": False, "error": f"美债收益率停在 {last_dt.strftime('%Y-%m-%d')}"}
+    value = float(work["收益率"].iloc[-1])
+    return {
+        "ok": True,
+        "alarm": value >= US_YIELD_ALARM,
+        "severe": value >= US_YIELD_SEVERE,
+        "y10": round(value, 2),
+        "asof": last_dt.strftime("%Y-%m-%d"),
+        "error": "",
+    }
+
+
+def _reduction_page(page: int) -> list[dict]:
+    import requests
+
+    resp = requests.get(
+        "https://datacenter-web.eastmoney.com/api/data/v1/get",
+        params={
+            "sortColumns": "END_DATE,SECURITY_CODE,EITIME",
+            "sortTypes": "-1,-1,-1",
+            "pageSize": "500",
+            "pageNumber": str(page),
+            "reportName": "RPT_SHARE_HOLDER_INCREASE",
+            "quoteColumns": "f2~01~SECURITY_CODE~NEWEST_PRICE",
+            "quoteType": "0",
+            "columns": "SECURITY_CODE,SECURITY_NAME_ABBR,HOLDER_NAME,DIRECTION,CHANGE_NUM,END_DATE,NOTICE_DATE,CLOSE_PRICE,NEWEST_PRICE",
+            "source": "WEB",
+            "client": "WEB",
+            "filter": '(DIRECTION="减持")',
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    payload = resp.json().get("result") or {}
+    return payload.get("data") or []
+
+
+def load_reductions() -> dict:
+    """近 30 日已公告减持。变动数量按万股，金额 = 万股 × 价格 × 10000。"""
+    try:
+        rows: list[dict] = []
+        cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=30)
+        covered = False
+        for page in range(1, 4):
+            batch = _reduction_page(page)
+            if not batch:
+                break
+            rows.extend(batch)
+            oldest = pd.to_datetime([item.get("NOTICE_DATE") for item in batch], errors="coerce").min()
+            if pd.notna(oldest) and oldest <= cutoff:
+                covered = True
+                break
+    except Exception as exc:
+        return {"ok": False, "alarm": False, "error": str(exc)[:160]}
+    if not rows:
+        return {"ok": False, "alarm": False, "error": "股东减持公告为空"}
+    work = pd.DataFrame(rows)
+    work["公告日"] = pd.to_datetime(work["NOTICE_DATE"], errors="coerce")
+    window = work[work["公告日"] >= cutoff].copy()
+    if window.empty:
+        return {"ok": True, "alarm": False, "amount_yi": 0.0, "count": 0, "top": [], "covered": covered, "error": ""}
+    price = pd.to_numeric(window["CLOSE_PRICE"], errors="coerce")
+    price = price.fillna(pd.to_numeric(window.get("NEWEST_PRICE"), errors="coerce"))
+    qty = pd.to_numeric(window["CHANGE_NUM"], errors="coerce").abs()
+    amount = qty * price * 10000 / 1e8
+    window = window.assign(金额=amount)
+    total = float(amount.dropna().sum())
+    top = []
+    for _, item in window.dropna(subset=["金额"]).nlargest(5, "金额").iterrows():
+        top.append(
+            {
+                "名称": str(item.get("SECURITY_NAME_ABBR") or ""),
+                "股东": str(item.get("HOLDER_NAME") or ""),
+                "金额亿": round(float(item["金额"]), 2),
+                "公告日": item["公告日"].strftime("%Y-%m-%d"),
+            }
+        )
+    alarm = bool(covered and total >= REDUCTION_ALARM_YI)
+    return {
+        "ok": True,
+        "alarm": alarm,
+        "amount_yi": round(total, 2),
+        "count": int(amount.notna().sum()),
+        "top": top,
+        "covered": covered,
+        "error": "" if covered else "最近公告没有覆盖满30日，金额可能偏低，不据此报警",
+    }
+
+
+def load_industry_flow() -> dict:
+    """同花顺行业资金流，净额单位为亿元。单日流出不单独作为空仓层。"""
+    try:
+        raw = _call(lambda: ak.stock_fund_flow_industry(symbol="即时"), timeout=20)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:160]}
+    if raw is None or raw.empty or "净额" not in raw.columns:
+        return {"ok": False, "error": "无行业资金流"}
+    work = raw.copy()
+    work["净额"] = pd.to_numeric(work["净额"], errors="coerce")
+    work = work.dropna(subset=["净额"])
+    if work.empty:
+        return {"ok": False, "error": "行业资金流为空"}
+
+    def _side(frame: pd.DataFrame) -> list[dict]:
+        rows = []
+        for _, item in frame.iterrows():
+            rows.append({"行业": str(item["行业"]), "净额": round(float(item["净额"]), 2)})
+        return rows
+
+    growth = work[work["行业"].isin(GROWTH_INDUSTRIES)]
+    bank = work[work["行业"] == "银行"]
+    liquor = work[work["行业"] == "白酒"]
+    return {
+        "ok": True,
+        "outflow": _side(work.nsmallest(5, "净额")),
+        "inflow": _side(work.nlargest(5, "净额")),
+        "growth_net": round(float(growth["净额"].sum()), 2) if len(growth) else None,
+        "bank_net": round(float(bank["净额"].iloc[0]), 2) if len(bank) else None,
+        "liquor_net": round(float(liquor["净额"].iloc[0]), 2) if len(liquor) else None,
+        "error": "",
+    }
+
+
 def load_etf_states(codes: list[str]) -> dict[str, dict]:
     daily = fetch_pool_daily(codes, tail_days=900, max_workers=8, pause_sec=0, prefer_sina=None)
     out = {}
@@ -136,7 +330,60 @@ def load_etf_states(codes: list[str]) -> dict[str, dict]:
     return out
 
 
-def judge(pe_rows: list[dict], tech: dict[str, dict]) -> dict:
+def _margin_text(margin: dict) -> str:
+    if not margin.get("ok"):
+        return f"两融缺失：{margin.get('error') or '无数据'}"
+    direction = "减少" if margin["chg5"] < 0 else "增加"
+    flag = "，杠杆资金在撤" if margin["alarm"] else ""
+    return (
+        f"融资余额 {margin['balance']} 亿元（{margin['asof']}），"
+        f"近5个交易日{direction} {abs(margin['chg5'])} 亿元（{margin['pct5']}%），"
+        f"这5日里有 {margin['down_days']} 日下降{flag}"
+    )
+
+
+def _reduction_text(reduction: dict) -> str:
+    if not reduction.get("ok"):
+        return f"股东减持缺失：{reduction.get('error') or '无数据'}"
+    note = "已到单月1000亿参考线" if reduction["alarm"] else "未到单月1000亿参考线"
+    extra = f"。{reduction['error']}" if reduction.get("error") else ""
+    return f"近30日已公告股东减持估算 {reduction['amount_yi']} 亿元、{reduction['count']} 笔，{note}{extra}"
+
+
+def _flow_text(flow: dict) -> str:
+    if not flow.get("ok"):
+        return f"行业资金流缺失：{flow.get('error') or '无数据'}"
+    parts = []
+    if flow.get("growth_net") is not None:
+        parts.append(f"成长相关行业合计净额 {flow['growth_net']} 亿元")
+    if flow.get("bank_net") is not None:
+        parts.append(f"银行 {flow['bank_net']} 亿元")
+    if flow.get("liquor_net") is not None:
+        parts.append(f"白酒 {flow['liquor_net']} 亿元")
+    lead = "当日同花顺行业资金（亿元）：" + "，".join(parts) if parts else "当日同花顺行业资金已取到"
+    return lead + "。单日行业流向只说明钱往哪边走，不单独当成空仓"
+
+
+def _us_text(us: dict) -> str:
+    if not us.get("ok"):
+        return f"美债缺失：{us.get('error') or '无数据'}"
+    if us.get("severe"):
+        tone = "已到5%，高估值成长的外部约束偏紧"
+    elif us["alarm"]:
+        tone = "已过4.5%，全球风险资产估值承压"
+    else:
+        tone = "低于4.5%"
+    return f"美国10年期国债收益率 {us['y10']}%（{us['asof']}），{tone}"
+
+
+def judge(
+    pe_rows: list[dict],
+    tech: dict[str, dict],
+    margin: dict,
+    reduction: dict,
+    flow: dict,
+    us: dict,
+) -> dict:
     growth_pe = next((r for r in pe_rows if r["name"] == "创业板50" and r.get("ok")), None)
     broad_pe = next((r for r in pe_rows if r["name"] == "沪深300" and r.get("ok")), None)
     div_pe = next((r for r in pe_rows if r["name"] == "上证红利" and r.get("ok")), None)
@@ -154,20 +401,30 @@ def judge(pe_rows: list[dict], tech: dict[str, dict]) -> dict:
 
     val_alarm = growth_hot or broad_hot
     tech_alarm = growth_tech_alarm or broad_break
+    capital_alarm = bool(margin.get("alarm") or reduction.get("alarm"))
+    external_alarm = bool(us.get("alarm"))
+    alarm_count = sum([val_alarm, capital_alarm, tech_alarm, external_alarm])
 
-    if broad_hot and broad_break:
+    if broad_hot and broad_break and alarm_count >= 2:
         regime = "降低仓位"
-        summary = "宽基估值和趋势同时转弱，先少做、多留现金，不要在这个位置加成长。"
-    elif growth_hot and growth_tech_alarm:
+        summary = "宽基估值和趋势同时转弱，先少做、多留现金。"
+    elif alarm_count >= 2 and growth_tech_alarm and (growth_hot or capital_alarm or external_alarm):
         regime = "结构性减仓"
-        summary = "贵的是成长方向，而且已经跌破均线。不是把账户清成现金，而是把仓位从成长迁走。"
-    elif val_alarm or tech_alarm:
+        summary = "至少两层一起转弱，而且成长方向已经跌破均线。先把仓位从这些方向迁走，红利和还站上均线的方向可以留着看。"
+    elif alarm_count >= 2 and growth_hot and capital_alarm:
+        regime = "结构性减仓"
+        summary = "成长估值和资金层一起报警。先少做成长，往还站上均线的方向看。"
+    elif alarm_count == 1:
         regime = "观察"
-        summary = "只有一层在报警，按讨论里的规则还不够构成空仓。先看，不因为单一指标砍仓。"
+        summary = "只有一层在报警，按讨论里的规则还不够降仓。先看，不因为单一指标砍仓。"
+    elif alarm_count >= 2:
+        regime = "观察"
+        summary = "有两层在报警，但成长和宽基的趋势还没有一起坏掉。先看结构和外部约束，不把仓位降成现金。"
     else:
         regime = "可以配置"
-        summary = "估值层和技术层都没有同时报警。可以拿着仓位，但只在还站上均线、分位不算极端的题材里选。"
+        summary = "四层都没有报警。可以拿着仓位，只在还站上均线、分位不算极端的题材里选。"
 
+    capital_ok = margin.get("ok") or reduction.get("ok")
     layers = [
         {
             "层": "估值",
@@ -175,14 +432,19 @@ def judge(pe_rows: list[dict], tech: dict[str, dict]) -> dict:
             "说明": _pe_text(growth_pe, broad_pe, div_pe),
         },
         {
+            "层": "资金",
+            "状态": "报警" if capital_alarm else ("正常" if capital_ok else "缺失"),
+            "说明": "；".join([_margin_text(margin), _reduction_text(reduction), _flow_text(flow)]),
+        },
+        {
             "层": "技术",
             "状态": "报警" if tech_alarm else ("正常" if cyb.get("ok") else "缺失"),
             "说明": _tech_text(cyb, star, hs300),
         },
         {
-            "层": "资金",
-            "状态": "缺失",
-            "说明": "板块资金流接口这次没有稳定返回，不参与判断。",
+            "层": "外部",
+            "状态": "报警" if external_alarm else ("正常" if us.get("ok") else "缺失"),
+            "说明": _us_text(us),
         },
     ]
     return {
@@ -261,15 +523,30 @@ def pick_themes(tech: dict[str, dict], regime: str) -> tuple[list[dict], list[di
 
 
 def run_cash_regime() -> dict:
-    pe_rows = []
-    for name, _group in PE_ANCHORS.items():
-        pe_rows.append(load_pe_anchor(name))
+    margin = load_margin()
+    us = load_us_yield()
+    reduction = load_reductions()
+    flow = load_industry_flow()
+    pe_rows = [load_pe_anchor(name) for name in PE_ANCHORS]
     codes = list(dict.fromkeys(list(TECH_ETFS) + list(THEME_ETFS)))
     tech = load_etf_states(codes)
-    decision = judge(pe_rows, tech)
+    decision = judge(pe_rows, tech, margin, reduction, flow, us)
     avoid, prefer, extended = pick_themes(tech, decision["regime"])
     if decision["regime"] == "降低仓位":
         prefer = [p for p in prefer if p["分组"] in ("红利", "避险", "红利周期")][:5]
+    gaps = []
+    if not margin.get("ok"):
+        gaps.append("两融")
+    if not reduction.get("ok"):
+        gaps.append("股东减持")
+    if not flow.get("ok"):
+        gaps.append("行业资金流")
+    if not us.get("ok"):
+        gaps.append("美债")
+    if gaps:
+        missing = "这次没取到：" + "、".join(gaps) + "。缺失的层不参与打分。"
+    else:
+        missing = "两融、股东减持、行业资金流和美债都已取到。减持金额是已公告变动股数乘价格的估算，不是减持计划上限。行业资金是当日净额，只用来看迁仓方向。"
     return {
         "regime": decision["regime"],
         "summary": decision["summary"],
@@ -278,5 +555,7 @@ def run_cash_regime() -> dict:
         "avoid": avoid,
         "prefer": prefer,
         "extended": extended,
-        "missing": "资金流向、两融、产业资本减持、美债收益率这次没有接入，所以结论只来自估值和技术两层。",
+        "flow": flow,
+        "reduction_top": reduction.get("top") or [],
+        "missing": missing,
     }

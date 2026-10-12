@@ -1386,8 +1386,8 @@ elif active_tab == TAB_CASH:
 
     st.markdown(
         "判断要不要降仓，以及不降仓时看哪些题材。"
-        "至少**估值**和**技术**两层同时报警才算空仓或结构性减仓。"
-        "资金流、两融、减持、美债这次没有接入，缺失的层不参与打分。"
+        "估值、资金、技术、外部至少两层同时报警，才降低仓位或从成长迁走。"
+        "取不到的层标为缺失，不参与打分。"
     )
     if st.button("计算当前仓位判断", type="primary", key="btn_cash_regime"):
         st.session_state["cash_regime_pending"] = True
@@ -1407,6 +1407,17 @@ elif active_tab == TAB_CASH:
         st.subheader(data["regime"])
         st.write(data["summary"])
         st.dataframe(pd.DataFrame(data["layers"]), hide_index=True, use_container_width=True)
+        flow = data.get("flow") or {}
+        if flow.get("ok"):
+            st.caption("当日行业资金净额（亿元，同花顺）。单日流向只看钱往哪边走。")
+            left = pd.DataFrame(flow.get("outflow") or [])
+            right = pd.DataFrame(flow.get("inflow") or [])
+            c1, c2 = st.columns(2)
+            c1.dataframe(left, hide_index=True, use_container_width=True)
+            c2.dataframe(right, hide_index=True, use_container_width=True)
+        if data.get("reduction_top"):
+            st.caption("近30日已公告股东减持，金额按变动股数（万股）×价格估算。")
+            st.dataframe(pd.DataFrame(data["reduction_top"]), hide_index=True, use_container_width=True)
         pe_ok = [r for r in data["pe"] if r.get("ok")]
         if pe_ok:
             st.caption("指数滚动市盈率（月频，乐咕）")
