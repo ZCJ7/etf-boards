@@ -128,8 +128,18 @@ TAB_SUPPORT = "📍 支撑位"
 TAB_RESIST = "🚧 压力位"
 TAB_TRADES = "📷 交易截图"
 TAB_RATIO = "⚖️ 比价线"
+TAB_MOMENTUM = "🚀 Top5动量"
 TAB_ETFIRST = "🏦 ETFirst"
-TAB_OPTIONS = [TAB_CORE, TAB_DETAIL, TAB_SUPPORT, TAB_RESIST, TAB_TRADES, TAB_RATIO, TAB_ETFIRST]
+TAB_OPTIONS = [
+    TAB_CORE,
+    TAB_DETAIL,
+    TAB_SUPPORT,
+    TAB_RESIST,
+    TAB_TRADES,
+    TAB_RATIO,
+    TAB_MOMENTUM,
+    TAB_ETFIRST,
+]
 
 # 加载榜单过程中 / 刚点加载后，强制留在比价线（须在控件创建前写入）
 if (
@@ -1258,6 +1268,115 @@ elif active_tab == TAB_RATIO:
             st.plotly_chart(fig, use_container_width=True, key=f"ratio_chart_{den_code}")
 
         st.info("比价线 = 分子收盘价 / 分母收盘价。比价BIAS 衡量相对强弱，可用于判断行业ETF相对大盘的位置。")
+
+# ── Top5 动量轮动 ────────────────────────────────────────
+elif active_tab == TAB_MOMENTUM:
+    from analysis.momentum_top5 import ETF_UNIVERSE, ONE_WAY_COST, run_all
+
+    st.markdown(
+        "轻量 **Top5 动量轮动**：近25日加权回归 Score = 年化斜率收益 × R²；"
+        "需斜率>0、收盘>MA20、近5日均成交额≥2000万。"
+        f"月末收盘出信号，下一交易日开盘调仓；不足5只时剩余为现金。单边成本 {ONE_WAY_COST * 100:.2f}%。"
+    )
+    with st.expander("观察池（可在 analysis/momentum_top5.py 增删）"):
+        st.dataframe(
+            pd.DataFrame([{"代码": k, "名称": v} for k, v in ETF_UNIVERSE.items()]),
+            hide_index=True,
+            use_container_width=True,
+        )
+    if st.button("计算当前 Top5 并回测", type="primary", key="btn_mom_top5"):
+        st.session_state["mom_top5_pending"] = True
+        st.session_state.pop("mom_top5_result", None)
+    if st.session_state.get("mom_top5_pending") and "mom_top5_result" not in st.session_state:
+        with st.spinner("拉取观察池日K并回测（约几秒到几十秒）..."):
+            try:
+                st.session_state["mom_top5_result"] = {"data": run_all(), "error": None}
+            except Exception as exc:
+                st.session_state["mom_top5_result"] = {"data": None, "error": str(exc)}
+            st.session_state["mom_top5_pending"] = False
+    pack = st.session_state.get("mom_top5_result")
+    if pack and pack.get("error"):
+        st.error(pack["error"][:400])
+    elif pack and pack.get("data"):
+        data = pack["data"]
+        top = data["top"]
+        bt = data["backtest"]
+        if top.get("error"):
+            st.warning(top["error"])
+        else:
+            st.caption(
+                f"信号日 {top['signal_date']} · 行情截止 {top['asof']} · "
+                f"计划调仓 {top['plan_rebalance']} · 符合条件 {top['eligible_count']} 只"
+            )
+            st.subheader("当前 Top5")
+            if top["rows"]:
+                st.dataframe(pd.DataFrame(top["rows"]), hide_index=True, use_container_width=True)
+            else:
+                st.info("当前没有符合筛选条件的 ETF，视为空仓/现金。")
+        if bt.get("error"):
+            st.error(bt["error"])
+        else:
+            st.subheader(f"回测对比 {bt['start']} ~ {bt['end']}")
+            compare = bt["compare"].copy()
+
+            def _fmt_pct(x):
+                return None if x is None or (isinstance(x, float) and x != x) else f"{x * 100:.2f}%"
+
+            show = compare.copy()
+            for col in ["累计收益率", "年化收益率CAGR", "最大回撤", "年化波动率"]:
+                show[col] = show[col].map(_fmt_pct)
+            st.dataframe(show, hide_index=True, use_container_width=True)
+
+            navs = bt["navs"]
+            fig = go.Figure()
+            colors = {
+                "Top5动量": "#dc2626",
+                "Top1动量": "#b45309",
+                "观察池等权": "#2563eb",
+                "沪深300持有": "#64748b",
+            }
+            for name, series in navs.items():
+                fig.add_trace(
+                    go.Scatter(
+                        x=series.index,
+                        y=series.values,
+                        name=name,
+                        line=dict(color=colors.get(name, "#0f172a"), width=2),
+                    )
+                )
+            apply_chart_style(fig, height=420, title="累计净值")
+            st.plotly_chart(fig, use_container_width=True, key="mom_top5_nav")
+
+            dd = bt["top5"]["metrics"].get("回撤序列")
+            if dd is not None and len(dd):
+                dd_fig = go.Figure()
+                dd_fig.add_trace(
+                    go.Scatter(
+                        x=dd.index,
+                        y=dd.values,
+                        name="回撤",
+                        fill="tozeroy",
+                        line=dict(color="#b45309", width=1.5),
+                    )
+                )
+                apply_chart_style(dd_fig, height=280, title="Top5 回撤")
+                st.plotly_chart(dd_fig, use_container_width=True, key="mom_top5_dd")
+
+            annual = bt["top5"]["metrics"].get("年度收益率")
+            if isinstance(annual, pd.Series) and len(annual):
+                st.caption("Top5 年度收益率")
+                st.dataframe(
+                    pd.DataFrame({"年份": annual.index.astype(str), "收益率%": (annual * 100).round(2)}),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+            st.subheader("精简分析")
+            st.markdown(bt["analysis"])
+            if data.get("issues"):
+                with st.expander("数据说明"):
+                    for item in data["issues"]:
+                        st.write(f"- {item}")
 
 # ── ETFirst ──────────────────────────────────────────────
 elif active_tab == TAB_ETFIRST:

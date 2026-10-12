@@ -258,6 +258,7 @@ def write_pages_html(
     resist_html: str = "",
     levels_script: str = "",
     levels_json: str = "",
+    momentum_html: str = "",
 ) -> None:
     docs = ROOT / "docs"
     docs.mkdir(parents=True, exist_ok=True)
@@ -318,11 +319,13 @@ def write_pages_html(
   <nav class="tabs">
     <button type="button" class="tab on" data-tab="support">支撑位</button>
     <button type="button" class="tab" data-tab="resist">压力位</button>
+    <button type="button" class="tab" data-tab="momentum">动量Top5</button>
     <button type="button" class="tab" data-tab="style">比价</button>
     <button type="button" class="tab" data-tab="boards">榜单</button>
   </nav>
   <div id="panel-support" class="panel">{support_html}</div>
   <div id="panel-resist" class="panel" hidden>{resist_html}</div>
+  <div id="panel-momentum" class="panel" hidden>{momentum_html}</div>
   <div id="panel-style" class="panel" hidden>{style_html}</div>
   <div id="panel-boards" class="panel" hidden>{body}</div>
   {levels_script}
@@ -381,6 +384,23 @@ def main() -> int:
     else:
         print("    ok", flush=True)
 
+    print("==> Top5 动量轮动", flush=True)
+    momentum_html = ""
+    try:
+        from scripts.momentum_page import save_momentum_artifacts
+
+        artifacts = save_momentum_artifacts()
+        momentum_html = artifacts["html"]
+        print("    ok", flush=True)
+    except Exception as exc:
+        errors["momentum_top5"] = str(exc)
+        momentum_html = (
+            "<section id='momentum'><h2>Top5 动量</h2>"
+            f"<p class='note'>计算失败：{html.escape(str(exc))}</p></section>"
+        )
+        print(f"    fail  {exc}", flush=True)
+        traceback.print_exc()
+
     save_boards_snapshot(
         asof=asof,
         generated_at=generated_at,
@@ -403,6 +423,7 @@ def main() -> int:
         resist_html,
         levels_script,
         levels_json,
+        momentum_html,
     )
     snap = load_boards_snapshot()
     rows = (snap or {}).get("meta", {}).get("rows", {})
