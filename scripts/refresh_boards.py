@@ -259,6 +259,7 @@ def write_pages_html(
     levels_script: str = "",
     levels_json: str = "",
     momentum_html: str = "",
+    cash_html: str = "",
 ) -> None:
     docs = ROOT / "docs"
     docs.mkdir(parents=True, exist_ok=True)
@@ -320,12 +321,14 @@ def write_pages_html(
     <button type="button" class="tab on" data-tab="support">支撑位</button>
     <button type="button" class="tab" data-tab="resist">压力位</button>
     <button type="button" class="tab" data-tab="momentum">动量Top5</button>
+    <button type="button" class="tab" data-tab="cash">仓位题材</button>
     <button type="button" class="tab" data-tab="style">比价</button>
     <button type="button" class="tab" data-tab="boards">榜单</button>
   </nav>
   <div id="panel-support" class="panel">{support_html}</div>
   <div id="panel-resist" class="panel" hidden>{resist_html}</div>
   <div id="panel-momentum" class="panel" hidden>{momentum_html}</div>
+  <div id="panel-cash" class="panel" hidden>{cash_html}</div>
   <div id="panel-style" class="panel" hidden>{style_html}</div>
   <div id="panel-boards" class="panel" hidden>{body}</div>
   {levels_script}
@@ -401,6 +404,21 @@ def main() -> int:
         print(f"    fail  {exc}", flush=True)
         traceback.print_exc()
 
+    print("==> 仓位与题材", flush=True)
+    cash_html = ""
+    try:
+        from scripts.cash_page import render_cash_section
+
+        cash_html = render_cash_section()
+        print("    ok", flush=True)
+    except Exception as exc:
+        errors["cash_regime"] = str(exc)
+        cash_html = (
+            "<section id='cash'><h2>仓位与题材</h2>"
+            f"<p class='note'>计算失败：{html.escape(str(exc))}</p></section>"
+        )
+        print(f"    fail  {exc}", flush=True)
+
     save_boards_snapshot(
         asof=asof,
         generated_at=generated_at,
@@ -424,6 +442,7 @@ def main() -> int:
         levels_script,
         levels_json,
         momentum_html,
+        cash_html,
     )
     snap = load_boards_snapshot()
     rows = (snap or {}).get("meta", {}).get("rows", {})

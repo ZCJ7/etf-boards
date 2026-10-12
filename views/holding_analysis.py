@@ -129,6 +129,7 @@ TAB_RESIST = "🚧 压力位"
 TAB_TRADES = "📷 交易截图"
 TAB_RATIO = "⚖️ 比价线"
 TAB_MOMENTUM = "🚀 Top5动量"
+TAB_CASH = "🧭 仓位题材"
 TAB_ETFIRST = "🏦 ETFirst"
 TAB_OPTIONS = [
     TAB_CORE,
@@ -138,6 +139,7 @@ TAB_OPTIONS = [
     TAB_TRADES,
     TAB_RATIO,
     TAB_MOMENTUM,
+    TAB_CASH,
     TAB_ETFIRST,
 ]
 
@@ -1377,6 +1379,50 @@ elif active_tab == TAB_MOMENTUM:
                 with st.expander("数据说明"):
                     for item in data["issues"]:
                         st.write(f"- {item}")
+
+# ── 空仓与题材 ──────────────────────────────────────────
+elif active_tab == TAB_CASH:
+    from analysis.cash_regime import run_cash_regime
+
+    st.markdown(
+        "判断要不要降仓，以及不降仓时看哪些题材。"
+        "至少**估值**和**技术**两层同时报警才算空仓或结构性减仓。"
+        "资金流、两融、减持、美债这次没有接入，缺失的层不参与打分。"
+    )
+    if st.button("计算当前仓位判断", type="primary", key="btn_cash_regime"):
+        st.session_state["cash_regime_pending"] = True
+        st.session_state.pop("cash_regime_result", None)
+    if st.session_state.get("cash_regime_pending") and "cash_regime_result" not in st.session_state:
+        with st.spinner("读取指数市盈率和题材 ETF 日K..."):
+            try:
+                st.session_state["cash_regime_result"] = {"data": run_cash_regime(), "error": None}
+            except Exception as exc:
+                st.session_state["cash_regime_result"] = {"data": None, "error": str(exc)}
+            st.session_state["cash_regime_pending"] = False
+    cash_pack = st.session_state.get("cash_regime_result")
+    if cash_pack and cash_pack.get("error"):
+        st.error(cash_pack["error"][:400])
+    elif cash_pack and cash_pack.get("data"):
+        data = cash_pack["data"]
+        st.subheader(data["regime"])
+        st.write(data["summary"])
+        st.dataframe(pd.DataFrame(data["layers"]), hide_index=True, use_container_width=True)
+        pe_ok = [r for r in data["pe"] if r.get("ok")]
+        if pe_ok:
+            st.caption("指数滚动市盈率（月频，乐咕）")
+            st.dataframe(pd.DataFrame(pe_ok)[["name", "pe", "percentile", "asof"]], hide_index=True, use_container_width=True)
+        st.subheader("现在可以看的题材")
+        if data["prefer"]:
+            st.dataframe(pd.DataFrame(data["prefer"]), hide_index=True, use_container_width=True)
+        else:
+            st.info("没有同时站上均线、价格分位也不极端的题材。")
+        if data.get("extended"):
+            st.caption("还站上均线，但价格已经涨到近3年高位，只能当趋势持有，不适合追。")
+            st.dataframe(pd.DataFrame(data["extended"]), hide_index=True, use_container_width=True)
+        st.subheader("先避开")
+        if data["avoid"]:
+            st.dataframe(pd.DataFrame(data["avoid"]), hide_index=True, use_container_width=True)
+        st.caption(data["missing"])
 
 # ── ETFirst ──────────────────────────────────────────────
 elif active_tab == TAB_ETFIRST:
