@@ -1385,9 +1385,9 @@ elif active_tab == TAB_CASH:
     from analysis.cash_regime import run_cash_regime
 
     st.markdown(
-        "判断要不要降仓，以及不降仓时看哪些题材。"
-        "估值、资金、技术、外部至少两层同时报警，才降低仓位或从成长迁走。"
-        "取不到的层标为缺失，不参与打分。"
+        "先判断整个市场是不是已经跌进中期下行，再决定要不要降低仓位。"
+        "没到空仓条件时，在科技、医药、消费、周期、金融红利、跨境、避险里选方向。"
+        "方向分看趋势、近20日强弱、行业资金和近14日行业研报。"
     )
     if st.button("计算当前仓位判断", type="primary", key="btn_cash_regime"):
         st.session_state["cash_regime_pending"] = True
@@ -1407,6 +1407,16 @@ elif active_tab == TAB_CASH:
         st.subheader(data["regime"])
         st.write(data["summary"])
         st.dataframe(pd.DataFrame(data["layers"]), hide_index=True, use_container_width=True)
+        if data.get("market"):
+            st.caption("五个宽基。跌破 MA60 才计入下行期。")
+            st.dataframe(pd.DataFrame(data["market"]), hide_index=True, use_container_width=True)
+        if data.get("directions"):
+            st.caption("大方向分数。至少一半代表 ETF 站上 MA20，并且分数达到 40，才可能被选中。")
+            st.dataframe(pd.DataFrame(data["directions"]), hide_index=True, use_container_width=True)
+        if data.get("reports"):
+            st.caption("策略研报摘录，不进分数。")
+            for line in data["reports"]:
+                st.write(f"- {line}")
         flow = data.get("flow") or {}
         if flow.get("ok"):
             st.caption("当日行业资金净额（亿元，同花顺）。单日流向只看钱往哪边走。")
@@ -1422,15 +1432,15 @@ elif active_tab == TAB_CASH:
         if pe_ok:
             st.caption("指数滚动市盈率（月频，乐咕）")
             st.dataframe(pd.DataFrame(pe_ok)[["name", "pe", "percentile", "asof"]], hide_index=True, use_container_width=True)
-        st.subheader("现在可以看的题材")
+        st.subheader("优先方向里的 ETF")
         if data["prefer"]:
             st.dataframe(pd.DataFrame(data["prefer"]), hide_index=True, use_container_width=True)
         else:
-            st.info("没有同时站上均线、价格分位也不极端的题材。")
+            st.info("优先方向里没有价格分位还舒服的 ETF。")
         if data.get("extended"):
-            st.caption("还站上均线，但价格已经涨到近3年高位，只能当趋势持有，不适合追。")
+            st.caption("方向还能看，但这几只近3年价格已经很高，只适合拿着。")
             st.dataframe(pd.DataFrame(data["extended"]), hide_index=True, use_container_width=True)
-        st.subheader("先避开")
+        st.subheader("先不碰的方向")
         if data["avoid"]:
             st.dataframe(pd.DataFrame(data["avoid"]), hide_index=True, use_container_width=True)
         st.caption(data["missing"])

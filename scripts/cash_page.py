@@ -57,6 +57,42 @@ def _reduce_rows(items: list[dict]) -> str:
     )
 
 
+def _market_rows(items: list[dict]) -> str:
+    if not items:
+        return "<tr><td colspan='6'>无</td></tr>"
+    body = []
+    for r in items:
+        body.append(
+            "<tr>"
+            f"<td>{html.escape(str(r.get('指数') or ''))}</td><td>{html.escape(str(r.get('代码') or ''))}</td>"
+            f"<td>{r.get('收盘') if r.get('收盘') is not None else '—'}</td>"
+            f"<td>{r.get('MA60') if r.get('MA60') is not None else '—'}</td>"
+            f"<td>{r.get('近20日%') if r.get('近20日%') is not None else '—'}</td>"
+            f"<td>{html.escape(str(r.get('状态') or ''))}</td>"
+            "</tr>"
+        )
+    return "".join(body)
+
+
+def _dir_rows(items: list[dict]) -> str:
+    if not items:
+        return "<tr><td colspan='4'>无</td></tr>"
+    ordered = sorted(items, key=lambda x: -(x.get("分数") or 0))
+    return "".join(
+        "<tr>"
+        f"<td>{html.escape(str(r['方向']))}</td><td>{r['分数']}</td>"
+        f"<td>{html.escape(str(r['状态']))}</td><td>{html.escape(str(r['说明']))}</td>"
+        "</tr>"
+        for r in ordered
+    )
+
+
+def _strategy(items: list[str]) -> str:
+    if not items:
+        return "<li>这次没有取到策略研报</li>"
+    return "".join(f"<li>{html.escape(x)}</li>" for x in items)
+
+
 def render_cash_section(result: dict | None = None) -> str:
     result = result or run_cash_regime()
     layers = "".join(
@@ -71,9 +107,13 @@ def render_cash_section(result: dict | None = None) -> str:
     return f"""
 <section id='cash'>
   <h2>仓位与题材</h2>
-  <p class='note'>空仓不是清光全市场。估值、资金、技术、外部至少两层同时报警，才降低仓位或从成长迁走。取不到的层标为缺失，不参与打分。</p>
+  <p class='note'>先看五个宽基有没有一起跌破 MA60。至少四个跌破，并且两融、美债、估值、减持里再有一项确认，才适合降低仓位。否则就在科技、医药、消费、周期、金融红利、跨境、避险里选还站上 MA20 的方向。分数＝趋势45＋动量25＋资金20＋研报10。</p>
   <div class='metrics'><div class='metric'><span>当前判断</span><b>{html.escape(result['regime'])}</b></div></div>
   <p>{html.escape(result['summary'])}</p>
+  <h3>宽基趋势</h3>
+  <div class='wrap'><table><thead><tr><th>指数</th><th>代码</th><th>收盘</th><th>MA60</th><th>近20日%</th><th>状态</th></tr></thead><tbody>{_market_rows(result.get('market') or [])}</tbody></table></div>
+  <h3>大方向</h3>
+  <div class='wrap'><table><thead><tr><th>方向</th><th>分数</th><th>状态</th><th>说明</th></tr></thead><tbody>{_dir_rows(result.get('directions') or [])}</tbody></table></div>
   <div class='wrap'><table><thead><tr><th>层</th><th>状态</th><th>说明</th></tr></thead><tbody>{layers}</tbody></table></div>
   <h3>当日行业资金（亿元）</h3>
   <p class='note'>同花顺口径。左边是净流出最多的行业，右边是净流入最多的行业。单日流向只看钱往哪边走。</p>
@@ -82,12 +122,15 @@ def render_cash_section(result: dict | None = None) -> str:
   <div class='wrap'><table><thead><tr><th>名称</th><th>股东</th><th>估算金额（亿元）</th><th>公告日</th></tr></thead><tbody>{_reduce_rows(result.get('reduction_top') or [])}</tbody></table></div>
   <h3>指数滚动市盈率分位</h3>
   <div class='wrap'><table><thead><tr><th>指数</th><th>市盈率</th><th>历史分位%</th><th>截止</th></tr></thead><tbody>{pe_rows}</tbody></table></div>
-  <h3>现在可以看</h3>
+  <h3>策略研报摘录</h3>
+  <p class='note'>近几篇策略报告只作语气参考，不进分数。</p>
+  <ul>{_strategy(result.get('reports') or [])}</ul>
+  <h3>优先方向里可以看的 ETF</h3>
   <div class='wrap'><table><thead><tr><th>名称</th><th>代码</th><th>分组</th><th>站上MA20</th><th>近20日%</th><th>价格分位%</th><th>原因</th></tr></thead><tbody>{_rows(result['prefer'])}</tbody></table></div>
   <h3>均线上但价格分位很高</h3>
   <p class='note'>还没跌破均线，但近3年价格已经很靠上，适合拿着看，不适合追。</p>
   <div class='wrap'><table><thead><tr><th>名称</th><th>代码</th><th>分组</th><th>站上MA20</th><th>近20日%</th><th>价格分位%</th><th>原因</th></tr></thead><tbody>{_rows(result.get('extended') or [])}</tbody></table></div>
-  <h3>先避开</h3>
+  <h3>先不碰的方向</h3>
   <div class='wrap'><table><thead><tr><th>名称</th><th>代码</th><th>分组</th><th>站上MA20</th><th>近20日%</th><th>价格分位%</th><th>原因</th></tr></thead><tbody>{_rows(result['avoid'])}</tbody></table></div>
   <p class='note'>{html.escape(result['missing'])}</p>
 </section>

@@ -1,12 +1,17 @@
-"""空仓时机与板块迁移。
+"""先判断全市场，再选大方向。
 
-四层里至少两层同时报警，才降低仓位或从成长迁走。单一指标只提示。
-- 估值：乐咕指数滚动市盈率的历史分位（月频）
-- 资金：两融融资余额近 5 日变化；近 30 日已公告股东减持估算；同花顺行业资金流只作迁仓参考
-- 技术：对应 ETF 是否跌破向下的 MA20
-- 外部：美国 10 年期国债收益率
+空仓只在两件事同时出现时成立：
+1. 沪深300、中证500、中证1000、创业板、科创50 里，至少 4 个收盘跌破 MA60
+2. 再有一层确认：两融在撤、美债 10 年期达到 5%、宽基市盈率分位极高，或近 30 日减持估算达到 1000 亿
 
-取不到或过期的层标为缺失，不参与打分。减持金额是已公告变动股数乘收盘价，不是减持计划上限。
+没到这一步，就不把账户当成空仓。方向分（满分大约 100）：
+- 趋势 45：该方向代表 ETF 里站上 MA20 的比例
+- 动量 25：近 20 日收益在七个方向里的位置
+- 资金 20：对应行业当日净流入的位置；没有行业映射的记中性
+- 研报 10：近 14 日行业研报篇数的位置
+
+至少一半代表 ETF 还站上 MA20，并且分数达到 40，才进入优先方向，最多两个。
+研报和资金不能把已经跌破的方向抬回来。
 """
 
 from __future__ import annotations
@@ -14,7 +19,6 @@ from __future__ import annotations
 import concurrent.futures as cf
 
 import akshare as ak
-import numpy as np
 import pandas as pd
 
 from analysis.indicators import ensure_close
@@ -29,40 +33,74 @@ PE_ANCHORS = {
     "中证1000": "小盘",
 }
 
-# 技术确认用的场内 ETF
-TECH_ETFS = {
-    "159949": "创业板50ETF",
-    "159915": "创业板ETF",
-    "588000": "科创50ETF",
-    "510300": "沪深300ETF",
-    "510880": "红利ETF",
-}
+# 全市场是否进入下行期，只看这五个宽基
+MARKET = (
+    ("510300", "沪深300"),
+    ("510500", "中证500"),
+    ("512100", "中证1000"),
+    ("159915", "创业板"),
+    ("588000", "科创50"),
+)
 
-# 题材 ETF：非空仓时从这里选。成长标签用于结构性减仓时避开。
-THEME_ETFS = {
-    "588000": ("科创50ETF", "成长"),
-    "159915": ("创业板ETF", "成长"),
-    "512480": ("半导体ETF", "成长"),
-    "512760": ("芯片ETF", "成长"),
-    "159819": ("人工智能ETF", "成长"),
-    "515050": ("5GETF", "成长"),
-    "512010": ("医药ETF", "医药"),
-    "512400": ("有色金属ETF", "周期"),
-    "515220": ("煤炭ETF", "红利周期"),
-    "512800": ("银行ETF", "红利"),
-    "510880": ("红利ETF", "红利"),
-    "512890": ("红利低波ETF", "红利"),
-    "518880": ("黄金ETF", "避险"),
-    "159981": ("能源化工ETF", "周期"),
-    "512690": ("酒ETF", "消费"),
-    "513100": ("纳指ETF", "跨境"),
-    "510300": ("沪深300ETF", "宽基"),
-}
+# 大方向。flow_keys 用来加总行业资金，report_keys 用来数行业研报。
+# 列表顺序也是研报归类的优先级，避免「化学制药」被算进周期。
+DIRECTIONS = (
+    {
+        "name": "医药",
+        "etfs": (("512010", "医药ETF"),),
+        "flow_keys": ("制药", "生物制品", "中药", "医疗"),
+        "report_keys": ("医药", "制药", "创新药", "医疗", "中药", "生物制品"),
+    },
+    {
+        "name": "科技",
+        "etfs": (
+            ("588000", "科创50ETF"),
+            ("512480", "半导体ETF"),
+            ("512760", "芯片ETF"),
+            ("159819", "人工智能ETF"),
+            ("515050", "5GETF"),
+        ),
+        "flow_keys": ("半导体", "元件", "光学", "消费电子", "通信", "计算机", "软件", "互联网", "军工电子"),
+        "report_keys": ("半导体", "芯片", "通信", "计算机", "软件", "电子", "人工智能", "光模块", "科创", "算力"),
+    },
+    {
+        "name": "金融红利",
+        "etfs": (("512800", "银行ETF"), ("510880", "红利ETF"), ("512890", "红利低波ETF")),
+        "flow_keys": ("银行", "证券", "保险"),
+        "report_keys": ("银行", "非银", "证券", "保险", "红利"),
+    },
+    {
+        "name": "消费",
+        "etfs": (("159928", "消费ETF"), ("512690", "酒ETF")),
+        "flow_keys": ("白酒", "食品", "饮料", "家电", "旅游", "零售", "酒店"),
+        "report_keys": ("食品", "白酒", "饮料", "家电", "旅游", "零售", "酒店", "消费", "社服"),
+    },
+    {
+        "name": "周期",
+        "etfs": (("512400", "有色金属ETF"), ("515220", "煤炭ETF"), ("159981", "能源化工ETF")),
+        "flow_keys": ("工业金属", "贵金属", "小金属", "煤炭", "化学制品", "化学原料", "石油", "钢铁"),
+        "report_keys": ("有色", "煤炭", "化工", "石油", "钢铁", "金属", "锂电", "电池"),
+    },
+    {
+        "name": "跨境",
+        "etfs": (("513100", "纳指ETF"), ("513500", "标普500ETF")),
+        "flow_keys": (),
+        "report_keys": ("港股", "美股", "纳指", "恒生", "海外"),
+    },
+    {
+        "name": "避险",
+        "etfs": (("518880", "黄金ETF"),),
+        "flow_keys": (),
+        "report_keys": ("黄金",),
+    },
+)
 
-GROWTH_TAGS = {"成长"}
+DEFENSIVE = {"金融红利", "避险"}
 HOT_PCT = 85.0
-CHEAP_PCT = 50.0
 BROAD_HOT_PCT = 90.0
+PRICE_EXTENDED = 90.0
+MIN_ABOVE_RATIO = 0.5
+MIN_DIRECTION_SCORE = 40.0
 US_YIELD_ALARM = 4.5
 US_YIELD_SEVERE = 5.0
 REDUCTION_ALARM_YI = 1000.0
@@ -127,11 +165,20 @@ def _ma_state(close: pd.Series) -> dict:
     ma = float(ma20.iloc[-1])
     ma_prev = float(ma20.iloc[-6]) if len(ma20.dropna()) >= 6 else ma
     ret20 = float(s.iloc[-1] / s.iloc[-21] - 1) if len(s) >= 21 else None
+    ma60 = None
+    above_ma60 = None
+    if len(s) >= 60:
+        ma60_s = s.rolling(60).mean()
+        if pd.notna(ma60_s.iloc[-1]):
+            ma60 = round(float(ma60_s.iloc[-1]), 3)
+            above_ma60 = last > ma60
     return {
         "ok": True,
         "close": round(last, 3),
         "ma20": round(ma, 3),
+        "ma60": ma60,
         "above_ma20": last > ma,
+        "above_ma60": above_ma60,
         "ma_falling": ma < ma_prev,
         "ret20": None if ret20 is None else round(ret20 * 100, 2),
         "price_pct": _percentile(s.tail(756) if len(s) > 756 else s),
@@ -314,6 +361,7 @@ def load_industry_flow() -> dict:
         "growth_net": round(float(growth["净额"].sum()), 2) if len(growth) else None,
         "bank_net": round(float(bank["净额"].iloc[0]), 2) if len(bank) else None,
         "liquor_net": round(float(liquor["净额"].iloc[0]), 2) if len(liquor) else None,
+        "by_name": {str(item["行业"]): round(float(item["净额"]), 2) for _, item in work.iterrows()},
         "error": "",
     }
 
@@ -328,6 +376,109 @@ def load_etf_states(codes: list[str]) -> dict[str, dict]:
             continue
         out[code] = _ma_state(ensure_close(frame))
     return out
+
+
+def _rank_points(values: list[float | None], cap: float, neutral: float) -> list[float]:
+    """横向位置换算成分数。能比较的样本少于 2 个时，全部用中性分。"""
+    known = [(i, v) for i, v in enumerate(values) if v is not None]
+    out = [neutral] * len(values)
+    if len(known) < 2:
+        return out
+    for i, value in known:
+        pct = sum(1 for _, other in known if other <= value) / len(known)
+        out[i] = round(pct * cap, 1)
+    return out
+
+
+def _match_report(text: str) -> str | None:
+    for item in DIRECTIONS:
+        if any(key in text for key in item["report_keys"]):
+            return item["name"]
+    return None
+
+
+def load_reports() -> dict:
+    """近 14 日东方财富行业研报，按标题和行业名归到大方向。策略研报只摘录，不打分。"""
+    import datetime
+    import requests
+
+    end = datetime.date.today()
+    begin = end - datetime.timedelta(days=14)
+    url = "https://reportapi.eastmoney.com/report/list"
+
+    def fetch(qtype: str, pages: int, size: int) -> list[dict]:
+        rows: list[dict] = []
+        for page in range(1, pages + 1):
+            resp = requests.get(
+                url,
+                params={
+                    "industryCode": "*",
+                    "pageSize": str(size),
+                    "industry": "*",
+                    "rating": "*",
+                    "ratingChange": "*",
+                    "beginTime": begin.isoformat(),
+                    "endTime": end.isoformat(),
+                    "pageNo": str(page),
+                    "qType": qtype,
+                    "orgCode": "",
+                    "code": "",
+                    "p": str(page),
+                    "pageNum": str(page),
+                    "pageNumber": str(page),
+                },
+                timeout=20,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            batch = payload.get("data") or []
+            if not batch:
+                break
+            rows.extend(batch)
+            oldest = pd.to_datetime(batch[-1].get("publishDate"), errors="coerce")
+            if pd.isna(oldest) or oldest.normalize() < pd.Timestamp(begin):
+                break
+            if page * size >= int(payload.get("hits") or 0):
+                break
+        return rows
+
+    try:
+        industry_rows = fetch("1", 4, 80)
+        strategy_rows = fetch("2", 1, 8)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:160], "counts": {}, "samples": [], "strategy": []}
+
+    counts = {item["name"]: 0 for item in DIRECTIONS}
+    samples: dict[str, list[str]] = {item["name"]: [] for item in DIRECTIONS}
+    cutoff = pd.Timestamp(begin)
+    used = 0
+    for row in industry_rows:
+        published = pd.to_datetime(row.get("publishDate"), errors="coerce")
+        if pd.isna(published) or published.normalize() < cutoff:
+            continue
+        text = f"{row.get('industryName') or ''}{row.get('indvInduName') or ''}{row.get('title') or ''}"
+        name = _match_report(text)
+        used += 1
+        if not name:
+            continue
+        counts[name] += 1
+        title = str(row.get("title") or "").strip()
+        if title and len(samples[name]) < 2:
+            samples[name].append(title[:42])
+    strategy = []
+    for row in strategy_rows:
+        title = str(row.get("title") or "").strip()
+        org = str(row.get("orgSName") or "").strip()
+        if title:
+            strategy.append(f"{org}：{title}" if org else title)
+    return {
+        "ok": True,
+        "counts": counts,
+        "samples": samples,
+        "strategy": strategy[:5],
+        "used": used,
+        "error": "",
+    }
 
 
 def _margin_text(margin: dict) -> str:
@@ -376,6 +527,157 @@ def _us_text(us: dict) -> str:
     return f"美国10年期国债收益率 {us['y10']}%（{us['asof']}），{tone}"
 
 
+def _flow_nets(flow: dict) -> tuple[dict[str, float | None], dict[str, bool]]:
+    by_name = flow.get("by_name") or {}
+    nets: dict[str, float | None] = {}
+    matched: dict[str, bool] = {}
+    claimed: set[str] = set()
+    for item in DIRECTIONS:
+        if not item["flow_keys"] or not flow.get("ok"):
+            nets[item["name"]] = None
+            matched[item["name"]] = False
+            continue
+        total = 0.0
+        hit = False
+        for name, value in by_name.items():
+            if name in claimed:
+                continue
+            if any(key in name for key in item["flow_keys"]):
+                total += float(value)
+                hit = True
+                claimed.add(name)
+        nets[item["name"]] = round(total, 2) if hit else None
+        matched[item["name"]] = hit
+    return nets, matched
+
+
+def _etf_item(code: str, name: str, direction: str, row: dict, reason: str) -> dict:
+    return {
+        "代码": code,
+        "名称": name,
+        "分组": direction,
+        "收盘": row.get("close"),
+        "站上MA20": "是" if row.get("above_ma20") else "否",
+        "站上MA60": "是" if row.get("above_ma60") else ("缺失" if row.get("above_ma60") is None else "否"),
+        "近20日%": row.get("ret20"),
+        "价格分位%": row.get("price_pct"),
+        "原因": reason,
+    }
+
+
+def _score_directions(tech: dict[str, dict], flow: dict, reports: dict) -> list[dict]:
+    packs = []
+    for item in DIRECTIONS:
+        etfs = []
+        for code, name in item["etfs"]:
+            row = tech.get(code) or {}
+            if row.get("ok"):
+                etfs.append((code, name, row))
+        ok_n = len(etfs)
+        above = [one for one in etfs if one[2].get("above_ma20")]
+        ratio = (len(above) / ok_n) if ok_n else 0.0
+        rets = [one[2]["ret20"] for one in etfs if one[2].get("ret20") is not None]
+        mom = round(sum(rets) / len(rets), 2) if rets else None
+        pcts = [one[2]["price_pct"] for one in above if one[2].get("price_pct") is not None]
+        extended = bool(pcts) and (sorted(pcts)[len(pcts) // 2] >= PRICE_EXTENDED)
+        packs.append(
+            {
+                "name": item["name"],
+                "etfs": etfs,
+                "above": above,
+                "ratio": ratio,
+                "mom": mom,
+                "extended": extended,
+                "eligible": ok_n > 0 and ratio >= MIN_ABOVE_RATIO,
+            }
+        )
+    nets, _matched = _flow_nets(flow)
+    counts = reports.get("counts") or {}
+    mom_pts = _rank_points([p["mom"] if p["mom"] is not None else None for p in packs], 25, 12.5)
+    flow_pts = _rank_points([nets[p["name"]] for p in packs], 20, 10)
+    report_pts = _rank_points(
+        [float(counts.get(p["name"], 0)) for p in packs] if reports.get("ok") else [None] * len(packs),
+        10,
+        5,
+    )
+    rows = []
+    for i, pack in enumerate(packs):
+        trend_pts = round(45 * pack["ratio"], 1)
+        penalty = 8 if pack["extended"] else 0
+        score = round(max(0, trend_pts + mom_pts[i] + flow_pts[i] + report_pts[i] - penalty), 1)
+        net = nets[pack["name"]]
+        count = counts.get(pack["name"]) if reports.get("ok") else None
+        if not pack["etfs"]:
+            verdict = "数据缺失"
+        elif not pack["eligible"]:
+            verdict = "先不碰"
+        elif score < MIN_DIRECTION_SCORE:
+            verdict = "分数不够"
+        elif pack["extended"]:
+            verdict = "线上但价格已高"
+        else:
+            verdict = "可比较"
+        bits = [f"站上MA20的比例 {round(pack['ratio'] * 100)}%"]
+        if pack["mom"] is not None:
+            bits.append(f"近20日平均 {pack['mom']}%")
+        if net is None:
+            bits.append("行业资金中性")
+        else:
+            bits.append(f"行业资金 {net} 亿元")
+        if count is None:
+            bits.append("研报缺失")
+        else:
+            bits.append(f"近14日行业研报 {count} 篇")
+        if pack["extended"]:
+            bits.append("站上均线的ETF价格分位已高")
+        rows.append(
+            {
+                "方向": pack["name"],
+                "分数": score,
+                "趋势": trend_pts,
+                "动量": mom_pts[i],
+                "资金": flow_pts[i],
+                "研报": report_pts[i],
+                "状态": verdict,
+                "说明": "，".join(bits),
+                "eligible": pack["eligible"],
+                "extended": pack["extended"],
+                "etfs": pack["etfs"],
+                "above": pack["above"],
+            }
+        )
+    return rows
+
+
+def _market_rows(tech: dict[str, dict]) -> list[dict]:
+    rows = []
+    for code, name in MARKET:
+        row = tech.get(code) or {}
+        if not row.get("ok"):
+            rows.append({"代码": code, "指数": name, "状态": "缺失", "above_ma60": None})
+            continue
+        if row.get("above_ma60") is False:
+            state = "跌破MA60"
+        elif row.get("above_ma20"):
+            state = "站上MA60和MA20"
+        else:
+            state = "站上MA60，短线在MA20下"
+        rows.append(
+            {
+                "代码": code,
+                "指数": name,
+                "收盘": row["close"],
+                "MA20": row["ma20"],
+                "MA60": row.get("ma60"),
+                "近20日%": row.get("ret20"),
+                "状态": state,
+                "截止": row["asof"],
+                "above_ma60": row.get("above_ma60"),
+            }
+        )
+    return rows
+
+
 def judge(
     pe_rows: list[dict],
     tech: dict[str, dict],
@@ -383,67 +685,114 @@ def judge(
     reduction: dict,
     flow: dict,
     us: dict,
+    reports: dict,
 ) -> dict:
-    growth_pe = next((r for r in pe_rows if r["name"] == "创业板50" and r.get("ok")), None)
-    broad_pe = next((r for r in pe_rows if r["name"] == "沪深300" and r.get("ok")), None)
-    div_pe = next((r for r in pe_rows if r["name"] == "上证红利" and r.get("ok")), None)
+    broad = next((r for r in pe_rows if r["name"] == "沪深300" and r.get("ok")), None)
+    mid = next((r for r in pe_rows if r["name"] == "中证500" and r.get("ok")), None)
+    growth = next((r for r in pe_rows if r["name"] == "创业板50" and r.get("ok")), None)
+    div = next((r for r in pe_rows if r["name"] == "上证红利" and r.get("ok")), None)
+    val_hot = bool(broad and broad["percentile"] >= BROAD_HOT_PCT) or bool(
+        broad and mid and broad["percentile"] >= HOT_PCT and mid["percentile"] >= HOT_PCT
+    )
+    market = _market_rows(tech)
+    valid = [r for r in market if r.get("above_ma60") is not None]
+    below = [r for r in valid if r["above_ma60"] is False]
+    downtrend = len(valid) >= 4 and len(below) >= 4
+    confirms = []
+    if margin.get("alarm"):
+        confirms.append("两融余额在下降")
+    if us.get("severe"):
+        confirms.append("美债10年期收益率到了5%以上")
+    if val_hot:
+        confirms.append("宽基市盈率分位已经很高")
+    if reduction.get("alarm"):
+        confirms.append("股东减持估算到了1000亿")
 
-    growth_hot = bool(growth_pe and growth_pe["percentile"] >= HOT_PCT)
-    broad_hot = bool(broad_pe and broad_pe["percentile"] >= BROAD_HOT_PCT)
-
-    cyb = tech.get("159915") or {}
-    star = tech.get("588000") or {}
-    hs300 = tech.get("510300") or {}
-    growth_break = bool(cyb.get("ok") and (not cyb["above_ma20"]) and cyb.get("ma_falling"))
-    star_break = bool(star.get("ok") and (not star["above_ma20"]) and star.get("ma_falling"))
-    broad_break = bool(hs300.get("ok") and (not hs300["above_ma20"]) and hs300.get("ma_falling"))
-    growth_tech_alarm = growth_break or star_break
-
-    val_alarm = growth_hot or broad_hot
-    tech_alarm = growth_tech_alarm or broad_break
-    capital_alarm = bool(margin.get("alarm") or reduction.get("alarm"))
-    external_alarm = bool(us.get("alarm"))
-    alarm_count = sum([val_alarm, capital_alarm, tech_alarm, external_alarm])
-
-    if broad_hot and broad_break and alarm_count >= 2:
-        regime = "降低仓位"
-        summary = "宽基估值和趋势同时转弱，先少做、多留现金。"
-    elif alarm_count >= 2 and growth_tech_alarm and (growth_hot or capital_alarm or external_alarm):
-        regime = "结构性减仓"
-        summary = "至少两层一起转弱，而且成长方向已经跌破均线。先把仓位从这些方向迁走，红利和还站上均线的方向可以留着看。"
-    elif alarm_count >= 2 and growth_hot and capital_alarm:
-        regime = "结构性减仓"
-        summary = "成长估值和资金层一起报警。先少做成长，往还站上均线的方向看。"
-    elif alarm_count == 1:
-        regime = "观察"
-        summary = "只有一层在报警，按讨论里的规则还不够降仓。先看，不因为单一指标砍仓。"
-    elif alarm_count >= 2:
-        regime = "观察"
-        summary = "有两层在报警，但成长和宽基的趋势还没有一起坏掉。先看结构和外部约束，不把仓位降成现金。"
+    directions = _score_directions(tech, flow, reports)
+    ranked = sorted(directions, key=lambda x: -x["分数"])
+    picks = [r for r in ranked if r["eligible"] and r["分数"] >= MIN_DIRECTION_SCORE]
+    if downtrend and confirms:
+        picks = [r for r in picks if r["方向"] in DEFENSIVE]
+        regime = "适合降低仓位"
+    elif downtrend:
+        regime = "市场偏弱"
+    elif len(below) >= 2:
+        regime = "分化配置"
     else:
         regime = "可以配置"
-        summary = "四层都没有报警。可以拿着仓位，只在还站上均线、分位不算极端的题材里选。"
+    picks = picks[:2]
+    picked_names = {r["方向"] for r in picks}
+    for row in directions:
+        chosen = row["方向"] in picked_names
+        if chosen and row["extended"]:
+            row["状态"] = "优先但价格已高"
+        elif chosen:
+            row["状态"] = "优先"
+        elif row["状态"] == "数据缺失":
+            continue
+        elif not row["eligible"]:
+            row["状态"] = "先不碰"
+        elif regime == "适合降低仓位":
+            row["状态"] = "趋势还在，先降仓"
+        elif row["分数"] < MIN_DIRECTION_SCORE:
+            row["状态"] = "分数不够"
+        else:
+            row["状态"] = "备选"
 
-    capital_ok = margin.get("ok") or reduction.get("ok")
+    weak_names = "、".join(r["指数"] for r in below) or "没有"
+    hold_names = "、".join(r["指数"] for r in valid if r["above_ma60"]) or "没有"
+    if regime == "适合降低仓位":
+        summary = (
+            f"五个宽基里有 {len(below)} 个收盘在 MA60 下方（{weak_names}），"
+            f"同时{'、'.join(confirms)}。这是全市场下行期，适合降低仓位。"
+        )
+    elif regime == "市场偏弱":
+        summary = (
+            f"五个宽基里有 {len(below)} 个收盘在 MA60 下方（{weak_names}）。"
+            "中期已经偏弱，但两融、美债、估值、减持还没有一起确认，仓位要轻。"
+        )
+        if picks:
+            summary += "还站得住的方向是" + "、".join(r["方向"] for r in picks) + "。"
+        else:
+            summary += "七个方向里也没有一半以上的代表 ETF 还站在 MA20 上。"
+    elif not picks:
+        regime = "没有清晰主线"
+        summary = (
+            f"还没到全市场空仓。站上 MA60 的是 {hold_names}。"
+            "七个方向里没有一个同时满足「至少一半 ETF 站上 MA20」和分数线，先观望。"
+        )
+    else:
+        names = "、".join(r["方向"] for r in picks)
+        summary = (
+            f"还没到全市场空仓。五个宽基里跌破 MA60 的有 {len(below)} 个，站上的是 {hold_names}。"
+            f"大方向上优先看{names}。"
+        )
+    if picks and any(r["extended"] for r in picks):
+        summary += "其中价格已经很高的，只适合拿着，不适合追。"
+    if regime == "适合降低仓位" and picks:
+        summary += "如果还要留一点仓，只看" + "、".join(r["方向"] for r in picks) + "。"
+    elif regime == "适合降低仓位":
+        summary += "防守方向自己也没站稳，留现金就行。"
+
     layers = [
         {
+            "层": "市场趋势",
+            "状态": "下行" if downtrend else ("正常" if valid else "缺失"),
+            "说明": f"{len(valid)} 个宽基有 MA60，其中 {len(below)} 个在均线下方。",
+        },
+        {
             "层": "估值",
-            "状态": "报警" if val_alarm else ("正常" if growth_pe and broad_pe else "缺失"),
-            "说明": _pe_text(growth_pe, broad_pe, div_pe),
+            "状态": "报警" if val_hot else ("正常" if broad and mid else "缺失"),
+            "说明": _pe_text(growth, broad, mid, div),
         },
         {
             "层": "资金",
-            "状态": "报警" if capital_alarm else ("正常" if capital_ok else "缺失"),
+            "状态": "报警" if margin.get("alarm") or reduction.get("alarm") else ("正常" if margin.get("ok") else "缺失"),
             "说明": "；".join([_margin_text(margin), _reduction_text(reduction), _flow_text(flow)]),
         },
         {
-            "层": "技术",
-            "状态": "报警" if tech_alarm else ("正常" if cyb.get("ok") else "缺失"),
-            "说明": _tech_text(cyb, star, hs300),
-        },
-        {
             "层": "外部",
-            "状态": "报警" if external_alarm else ("正常" if us.get("ok") else "缺失"),
+            "状态": "报警" if us.get("severe") else ("承压" if us.get("alarm") else ("正常" if us.get("ok") else "缺失")),
             "说明": _us_text(us),
         },
     ]
@@ -451,75 +800,53 @@ def judge(
         "regime": regime,
         "summary": summary,
         "layers": layers,
-        "growth_hot": growth_hot,
-        "growth_tech_alarm": growth_tech_alarm,
-        "broad_hot": broad_hot,
-        "broad_break": broad_break,
+        "market": market,
+        "directions": directions,
+        "picks": picks,
+        "downtrend": downtrend,
+        "confirms": confirms,
     }
 
 
-def _pe_text(growth, broad, div) -> str:
+def _pe_text(growth, broad, mid, div) -> str:
     parts = []
-    for row, label in ((growth, "创业板50"), (broad, "沪深300"), (div, "上证红利")):
+    for row, label in ((broad, "沪深300"), (mid, "中证500"), (growth, "创业板50"), (div, "上证红利")):
         if not row or not row.get("ok"):
             parts.append(f"{label}市盈率缺失")
             continue
-        parts.append(f"{label}滚动市盈率 {row['pe']} 倍，历史分位 {row['percentile']}%（{row['asof']}）")
+        parts.append(f"{label} {row['pe']} 倍，分位 {row['percentile']}%")
     return "；".join(parts)
 
 
-def _tech_text(cyb, star, hs300) -> str:
-    def one(name, row):
-        if not row or not row.get("ok"):
-            return f"{name}缺失"
-        side = "站上" if row["above_ma20"] else "跌破"
-        slope = "向下" if row["ma_falling"] else "没有向下"
-        return f"{name} {row['close']}，{side} MA20（{row['ma20']}），均线{slope}，截止 {row['asof']}"
-
-    return "；".join([one("创业板ETF", cyb), one("科创50ETF", star), one("沪深300ETF", hs300)])
-
-
-def pick_themes(tech: dict[str, dict], regime: str) -> tuple[list[dict], list[dict], list[dict]]:
-    """返回 (避开, 可看, 均线上但价格分位很高)。
-
-    估值贵不贵看市盈率分位；这里的价格分位只说明这段涨多了。
-    跌破 MA20 的放进避开。还站上均线、价格分位没到 90 的放进可看。
-    """
-    avoid, prefer, extended = [], [], []
-    structural = regime in ("结构性减仓", "降低仓位")
-    for code, (name, tag) in THEME_ETFS.items():
-        row = tech.get(code) or {}
-        if not row.get("ok"):
-            continue
-        pct = row.get("price_pct")
-        item = {
-            "代码": code,
-            "名称": name,
-            "分组": tag,
-            "收盘": row["close"],
-            "站上MA20": "是" if row["above_ma20"] else "否",
-            "近20日%": row["ret20"],
-            "价格分位%": pct,
-            "截止": row["asof"],
-        }
-        if not row["above_ma20"]:
-            item["原因"] = "已跌破 MA20"
-            avoid.append(item)
-            continue
-        if structural and tag in GROWTH_TAGS:
-            item["原因"] = "成长方向在减仓名单里"
-            avoid.append(item)
-            continue
-        if pct is not None and pct >= 90:
-            item["原因"] = "还站上均线，但近3年价格分位已经很高"
-            extended.append(item)
-            continue
-        item["原因"] = "站上均线，价格分位不算极端"
-        prefer.append(item)
+def _pick_etfs(directions: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    prefer, extended, avoid = [], [], []
+    for row in directions:
+        if row["状态"] in ("优先", "优先但价格已高"):
+            for code, name, etf in row["above"]:
+                reason = "方向优先，且站上 MA20"
+                item = _etf_item(code, name, row["方向"], etf, reason)
+                if etf.get("price_pct") is not None and etf["price_pct"] >= PRICE_EXTENDED:
+                    item["原因"] = "方向还在，但这只近3年价格分位已经很高"
+                    extended.append(item)
+                else:
+                    prefer.append(item)
+        elif row["状态"] == "先不碰":
+            avoid.append(
+                {
+                    "代码": "—",
+                    "名称": row["方向"],
+                    "分组": row["方向"],
+                    "收盘": "—",
+                    "站上MA20": "否",
+                    "站上MA60": "—",
+                    "近20日%": None,
+                    "价格分位%": None,
+                    "原因": row["说明"],
+                }
+            )
     prefer.sort(key=lambda x: -(x["近20日%"] or -999))
     extended.sort(key=lambda x: -(x["近20日%"] or -999))
-    avoid.sort(key=lambda x: (x["近20日%"] is None, x["近20日%"] or 0))
-    return avoid[:8], prefer[:5], extended[:5]
+    return prefer, extended, avoid
 
 
 def run_cash_regime() -> dict:
@@ -527,13 +854,14 @@ def run_cash_regime() -> dict:
     us = load_us_yield()
     reduction = load_reductions()
     flow = load_industry_flow()
+    reports = load_reports()
     pe_rows = [load_pe_anchor(name) for name in PE_ANCHORS]
-    codes = list(dict.fromkeys(list(TECH_ETFS) + list(THEME_ETFS)))
-    tech = load_etf_states(codes)
-    decision = judge(pe_rows, tech, margin, reduction, flow, us)
-    avoid, prefer, extended = pick_themes(tech, decision["regime"])
-    if decision["regime"] == "降低仓位":
-        prefer = [p for p in prefer if p["分组"] in ("红利", "避险", "红利周期")][:5]
+    codes = [code for code, _name in MARKET]
+    for item in DIRECTIONS:
+        codes.extend(code for code, _name in item["etfs"])
+    tech = load_etf_states(list(dict.fromkeys(codes)))
+    decision = judge(pe_rows, tech, margin, reduction, flow, us, reports)
+    prefer, extended, avoid = _pick_etfs(decision["directions"])
     gaps = []
     if not margin.get("ok"):
         gaps.append("两融")
@@ -543,19 +871,27 @@ def run_cash_regime() -> dict:
         gaps.append("行业资金流")
     if not us.get("ok"):
         gaps.append("美债")
+    if not reports.get("ok"):
+        gaps.append("行业研报")
     if gaps:
-        missing = "这次没取到：" + "、".join(gaps) + "。缺失的层不参与打分。"
+        missing = "这次没取到：" + "、".join(gaps) + "。缺的那一项记成中性，不单独改变结论。"
     else:
-        missing = "两融、股东减持、行业资金流和美债都已取到。减持金额是已公告变动股数乘价格的估算，不是减持计划上限。行业资金是当日净额，只用来看迁仓方向。"
+        missing = "两融、减持、行业资金、美债和近14日行业研报都已取到。减持金额是已公告变动的估算。策略研报只摘录，不进分数。"
+    public_dirs = []
+    for row in decision["directions"]:
+        public_dirs.append({k: v for k, v in row.items() if k not in ("etfs", "above", "eligible", "extended")})
     return {
         "regime": decision["regime"],
         "summary": decision["summary"],
         "layers": decision["layers"],
+        "market": decision["market"],
+        "directions": public_dirs,
         "pe": pe_rows,
         "avoid": avoid,
         "prefer": prefer,
         "extended": extended,
-        "flow": flow,
+        "flow": {k: v for k, v in flow.items() if k != "by_name"},
+        "reports": reports.get("strategy") or [],
         "reduction_top": reduction.get("top") or [],
         "missing": missing,
     }
