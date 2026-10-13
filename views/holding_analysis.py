@@ -1387,7 +1387,7 @@ elif active_tab == TAB_CASH:
     st.markdown(
         "先判断整个市场是不是已经跌进中期下行，再决定要不要降低仓位。"
         "没到空仓条件时，在科技、医药、消费、周期、金融红利、跨境、避险里选方向。"
-        "方向分看趋势、近20日强弱、行业资金和近14日行业研报。"
+        "是否值得参与，看沪深两市近5日平均成交额：低于1.5万亿不主动开仓，低于2万亿谨慎。"
     )
     if st.button("计算当前仓位判断", type="primary", key="btn_cash_regime"):
         st.session_state["cash_regime_pending"] = True

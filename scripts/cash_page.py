@@ -107,7 +107,7 @@ def render_cash_section(result: dict | None = None) -> str:
     return f"""
 <section id='cash'>
   <h2>仓位与题材</h2>
-  <p class='note'>先看五个宽基有没有一起跌破 MA60。至少四个跌破，并且两融、美债、估值、减持里再有一项确认，才适合降低仓位。否则就在科技、医药、消费、周期、金融红利、跨境、避险里选还站上 MA20 的方向。分数＝趋势45＋动量25＋资金20＋研报10。</p>
+  <p class='note'>是否值得参与，看沪深股票近5日平均成交额：低于1.5万亿不主动开仓，低于2万亿谨慎。空仓仍要五个宽基里至少四个跌破 MA60，再加两融、美债、估值、减持或下跌放量里的一项确认。</p>
   <div class='metrics'><div class='metric'><span>当前判断</span><b>{html.escape(result['regime'])}</b></div></div>
   <p>{html.escape(result['summary'])}</p>
   <h3>宽基趋势</h3>

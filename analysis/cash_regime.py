@@ -4,14 +4,23 @@
 1. 沪深300、中证500、中证1000、创业板、科创50 里，至少 4 个收盘跌破 MA60
 2. 再有一层确认：两融在撤、美债 10 年期达到 5%、宽基市盈率分位极高，或近 30 日减持估算达到 1000 亿
 
-没到这一步，就不把账户当成空仓。方向分（满分大约 100）：
-- 趋势 45：该方向代表 ETF 里站上 MA20 的比例
+全市场量能两层：
+- 沪深300 ETF 的 5 日/20 日成交额比：下跌放量才作为空仓确认，反弹缩量只提示
+- 沪深股票成交额（上证指数成交额 + 深证A指成交额）：近 5 日均值低于 1.5 万亿不主动开仓，低于 2 万亿谨慎。2 万亿是 2024 年以来的经验线，单日不用来拍板
+
+方向分（满分大约 100）：
+- 趋势 40：该方向代表 ETF 里站上 MA20 的比例
 - 动量 25：近 20 日收益在七个方向里的位置
-- 资金 20：对应行业当日净流入的位置；没有行业映射的记中性
+- 资金 15：对应行业当日净流入的位置
+- 量能 10：代表 ETF 近 5 日成交额 / 近 20 日成交额，在七个方向里的位置
 - 研报 10：近 14 日行业研报篇数的位置
 
+全市场量能单独看沪深300：下跌且 5 日均量高于 20 日均量，算「下跌放量」确认；
+近 20 日收涨但量能比低于 0.85，只提示「反弹缩量」，不单独触发空仓。
+是否值得参与，看沪深两市股票近 5 日平均成交额，不看单日是否跌破 2 万亿。
+
 至少一半代表 ETF 还站上 MA20，并且分数达到 40，才进入优先方向，最多两个。
-研报和资金不能把已经跌破的方向抬回来。
+缩量上涨、放量下跌会在方向说明里扣分提示。
 """
 
 from __future__ import annotations
@@ -101,6 +110,9 @@ BROAD_HOT_PCT = 90.0
 PRICE_EXTENDED = 90.0
 MIN_ABOVE_RATIO = 0.5
 MIN_DIRECTION_SCORE = 40.0
+TURN_COLD = 1.5e12
+TURN_CAUTION = 2.0e12
+TURN_HOT = 3.0e12
 US_YIELD_ALARM = 4.5
 US_YIELD_SEVERE = 5.0
 REDUCTION_ALARM_YI = 1000.0
@@ -156,7 +168,43 @@ def load_pe_anchor(symbol: str) -> dict:
     }
 
 
-def _ma_state(close: pd.Series) -> dict:
+def _amount_series(frame: pd.DataFrame, close: pd.Series) -> pd.Series:
+    for col in ("成交额", "amount", "Amount"):
+        if col in frame.columns:
+            amt = pd.to_numeric(frame[col], errors="coerce")
+            if amt.notna().sum() >= 10:
+                return amt
+    vol_col = "Volume" if "Volume" in frame.columns else ("成交量" if "成交量" in frame.columns else None)
+    if vol_col:
+        vol = pd.to_numeric(frame[vol_col], errors="coerce")
+        return vol * close * 100
+    return pd.Series(dtype=float, index=close.index)
+
+
+def _volume_metrics(close: pd.Series, amount: pd.Series) -> dict:
+    amt = pd.to_numeric(amount, errors="coerce").reindex(close.index)
+    if len(close) < 25 or amt.dropna().empty:
+        return {"amt_ratio": None, "tag": None}
+    a5 = float(amt.tail(5).mean())
+    a20 = float(amt.tail(20).mean())
+    if a20 <= 0:
+        return {"amt_ratio": None, "tag": None}
+    ratio = round(a5 / a20, 2)
+    ret20 = float(close.iloc[-1] / close.iloc[-21] - 1) if len(close) >= 21 else 0.0
+    if ret20 > 0.01 and ratio < 0.85:
+        tag = "缩量上涨"
+    elif ret20 < -0.02 and ratio > 1.15:
+        tag = "放量下跌"
+    elif ratio >= 1.1:
+        tag = "放量"
+    elif ratio <= 0.85:
+        tag = "缩量"
+    else:
+        tag = "中性"
+    return {"amt_ratio": ratio, "tag": tag}
+
+
+def _ma_state(close: pd.Series, amount: pd.Series | None = None) -> dict:
     s = pd.to_numeric(close, errors="coerce").dropna()
     if len(s) < 25:
         return {"ok": False}
@@ -172,7 +220,7 @@ def _ma_state(close: pd.Series) -> dict:
         if pd.notna(ma60_s.iloc[-1]):
             ma60 = round(float(ma60_s.iloc[-1]), 3)
             above_ma60 = last > ma60
-    return {
+    out = {
         "ok": True,
         "close": round(last, 3),
         "ma20": round(ma, 3),
@@ -183,6 +231,37 @@ def _ma_state(close: pd.Series) -> dict:
         "ret20": None if ret20 is None else round(ret20 * 100, 2),
         "price_pct": _percentile(s.tail(756) if len(s) > 756 else s),
         "asof": s.index[-1].strftime("%Y-%m-%d"),
+    }
+    if amount is not None and not amount.empty:
+        out.update(_volume_metrics(s, amount))
+    return out
+
+
+def _market_volume(tech: dict[str, dict]) -> dict:
+    row = tech.get("510300") or {}
+    if not row.get("ok"):
+        return {"ok": False, "text": "沪深300量能缺失"}
+    ratio = row.get("amt_ratio")
+    tag = row.get("tag")
+    ret20 = (row.get("ret20") or 0) / 100
+    below = row.get("above_ma60") is False
+    down_expand = bool(below and ret20 < 0 and ratio is not None and ratio >= 1.1)
+    weak_bounce = bool(below and ret20 > 0 and ratio is not None and ratio < 0.85)
+    parts = []
+    if ratio is not None:
+        parts.append(f"沪深300近5日成交额/近20日 {ratio}")
+    if tag:
+        parts.append(tag)
+    if down_expand:
+        parts.append("下跌放量，抛压仍在")
+    if weak_bounce:
+        parts.append("反弹缩量，可信度偏低")
+    return {
+        "ok": ratio is not None,
+        "ratio": ratio,
+        "down_expand": down_expand,
+        "weak_bounce": weak_bounce,
+        "text": "，".join(parts) if parts else "量能中性",
     }
 
 
@@ -366,6 +445,71 @@ def load_industry_flow() -> dict:
     }
 
 
+def load_market_turnover() -> dict:
+    """沪深股票成交额 = 上证指数成交额 + 深证A指成交额，单位元。"""
+    import requests
+
+    def one(secid: str) -> pd.Series:
+        resp = requests.get(
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+            params={
+                "secid": secid,
+                "klt": "101",
+                "fqt": "0",
+                "lmt": "260",
+                "end": "20500101",
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57",
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        lines = ((resp.json().get("data") or {}).get("klines")) or []
+        dates, amounts = [], []
+        for line in lines:
+            parts = line.split(",")
+            if len(parts) < 7:
+                continue
+            dates.append(pd.Timestamp(parts[0]))
+            amounts.append(float(parts[6]))
+        return pd.Series(amounts, index=dates, dtype=float)
+
+    try:
+        total = (one("1.000001") + one("0.399107")).dropna().sort_index()
+    except Exception as exc:
+        return {"ok": False, "state": "缺失", "text": f"两市成交额缺失：{str(exc)[:120]}"}
+    if len(total) < 20:
+        return {"ok": False, "state": "缺失", "text": "两市成交额样本不足"}
+    roll = total.rolling(5).mean().dropna()
+    avg5 = float(roll.iloc[-1])
+    latest = float(total.iloc[-1])
+    window = roll.tail(250)
+    pct = round(float((window <= avg5).mean() * 100), 1)
+    if avg5 < TURN_COLD:
+        state = "不适合主动参与"
+    elif avg5 < TURN_CAUTION or (pct <= 20 and avg5 < 2.2e12):
+        state = "谨慎参与"
+    elif avg5 >= TURN_HOT:
+        state = "量能偏热"
+    else:
+        state = "可以参与"
+    asof = total.index[-1].strftime("%Y-%m-%d")
+    text = (
+        f"沪深股票成交额 {latest / 1e12:.2f} 万亿（{asof}），"
+        f"近5日均值 {avg5 / 1e12:.2f} 万亿，近一年5日均值分位 {pct}%。"
+        "低于1.5万亿不主动开仓，低于2万亿谨慎；单日不单独拍板"
+    )
+    return {
+        "ok": True,
+        "state": state,
+        "latest": round(latest / 1e12, 2),
+        "avg5": round(avg5 / 1e12, 2),
+        "percentile": pct,
+        "asof": asof,
+        "text": text,
+    }
+
+
 def load_etf_states(codes: list[str]) -> dict[str, dict]:
     daily = fetch_pool_daily(codes, tail_days=900, max_workers=8, pause_sec=0, prefer_sina=None)
     out = {}
@@ -374,7 +518,8 @@ def load_etf_states(codes: list[str]) -> dict[str, dict]:
         if frame is None or frame.empty:
             out[code] = {"ok": False}
             continue
-        out[code] = _ma_state(ensure_close(frame))
+        close = ensure_close(frame)
+        out[code] = _ma_state(close, _amount_series(frame, close))
     return out
 
 
@@ -593,8 +738,13 @@ def _score_directions(tech: dict[str, dict], flow: dict, reports: dict) -> list[
         )
     nets, _matched = _flow_nets(flow)
     counts = reports.get("counts") or {}
+    vol_avgs = []
+    for pack in packs:
+        ratios = [one[2]["amt_ratio"] for one in pack["etfs"] if one[2].get("amt_ratio") is not None]
+        vol_avgs.append(round(sum(ratios) / len(ratios), 3) if ratios else None)
     mom_pts = _rank_points([p["mom"] if p["mom"] is not None else None for p in packs], 25, 12.5)
-    flow_pts = _rank_points([nets[p["name"]] for p in packs], 20, 10)
+    flow_pts = _rank_points([nets[p["name"]] for p in packs], 15, 7.5)
+    vol_pts = _rank_points(vol_avgs, 10, 5)
     report_pts = _rank_points(
         [float(counts.get(p["name"], 0)) for p in packs] if reports.get("ok") else [None] * len(packs),
         10,
@@ -602,9 +752,17 @@ def _score_directions(tech: dict[str, dict], flow: dict, reports: dict) -> list[
     )
     rows = []
     for i, pack in enumerate(packs):
-        trend_pts = round(45 * pack["ratio"], 1)
+        trend_pts = round(40 * pack["ratio"], 1)
         penalty = 8 if pack["extended"] else 0
-        score = round(max(0, trend_pts + mom_pts[i] + flow_pts[i] + report_pts[i] - penalty), 1)
+        tags = {one[2].get("tag") for one in pack["etfs"] if one[2].get("tag")}
+        if "缩量上涨" in tags:
+            penalty += 4
+        if "放量下跌" in tags and pack["mom"] is not None and pack["mom"] < 0:
+            penalty += 4
+        score = round(
+            max(0, trend_pts + mom_pts[i] + flow_pts[i] + vol_pts[i] + report_pts[i] - penalty),
+            1,
+        )
         net = nets[pack["name"]]
         count = counts.get(pack["name"]) if reports.get("ok") else None
         if not pack["etfs"]:
@@ -624,12 +782,18 @@ def _score_directions(tech: dict[str, dict], flow: dict, reports: dict) -> list[
             bits.append("行业资金中性")
         else:
             bits.append(f"行业资金 {net} 亿元")
+        if vol_avgs[i] is not None:
+            bits.append(f"量能比 {vol_avgs[i]}")
         if count is None:
             bits.append("研报缺失")
         else:
             bits.append(f"近14日行业研报 {count} 篇")
         if pack["extended"]:
             bits.append("站上均线的ETF价格分位已高")
+        if "缩量上涨" in tags:
+            bits.append("缩量上涨减分")
+        if "放量下跌" in tags:
+            bits.append("放量下跌减分")
         rows.append(
             {
                 "方向": pack["name"],
@@ -637,6 +801,7 @@ def _score_directions(tech: dict[str, dict], flow: dict, reports: dict) -> list[
                 "趋势": trend_pts,
                 "动量": mom_pts[i],
                 "资金": flow_pts[i],
+                "量能": vol_pts[i],
                 "研报": report_pts[i],
                 "状态": verdict,
                 "说明": "，".join(bits),
@@ -686,6 +851,7 @@ def judge(
     flow: dict,
     us: dict,
     reports: dict,
+    turnover: dict,
 ) -> dict:
     broad = next((r for r in pe_rows if r["name"] == "沪深300" and r.get("ok")), None)
     mid = next((r for r in pe_rows if r["name"] == "中证500" and r.get("ok")), None)
@@ -707,15 +873,24 @@ def judge(
         confirms.append("宽基市盈率分位已经很高")
     if reduction.get("alarm"):
         confirms.append("股东减持估算到了1000亿")
+    mvol = _market_volume(tech)
+    if mvol.get("down_expand"):
+        confirms.append("沪深300下跌放量")
 
     directions = _score_directions(tech, flow, reports)
     ranked = sorted(directions, key=lambda x: -x["分数"])
     picks = [r for r in ranked if r["eligible"] and r["分数"] >= MIN_DIRECTION_SCORE]
+    liquidity = turnover.get("state") if turnover.get("ok") else ""
     if downtrend and confirms:
         picks = [r for r in picks if r["方向"] in DEFENSIVE]
         regime = "适合降低仓位"
+    elif liquidity == "不适合主动参与":
+        picks = []
+        regime = "不适合主动参与"
     elif downtrend:
         regime = "市场偏弱"
+    elif liquidity == "谨慎参与":
+        regime = "谨慎参与"
     elif len(below) >= 2:
         regime = "分化配置"
     else:
@@ -732,7 +907,7 @@ def judge(
             continue
         elif not row["eligible"]:
             row["状态"] = "先不碰"
-        elif regime == "适合降低仓位":
+        elif regime in ("适合降低仓位", "不适合主动参与"):
             row["状态"] = "趋势还在，先降仓"
         elif row["分数"] < MIN_DIRECTION_SCORE:
             row["状态"] = "分数不够"
@@ -746,6 +921,21 @@ def judge(
             f"五个宽基里有 {len(below)} 个收盘在 MA60 下方（{weak_names}），"
             f"同时{'、'.join(confirms)}。这是全市场下行期，适合降低仓位。"
         )
+    elif regime == "不适合主动参与":
+        summary = (
+            f"近5日沪深股票成交额均值 {turnover.get('avg5')} 万亿，低于 1.5 万亿。"
+            "量能太差，不适合主动开新仓，先等成交额回到 2 万亿附近。"
+        )
+    elif regime == "谨慎参与":
+        names = "、".join(r["方向"] for r in picks) if picks else ""
+        summary = (
+            f"近5日沪深股票成交额均值 {turnover.get('avg5')} 万亿，低于 2 万亿经验线。"
+            "市场可以看，但仓位要小。"
+        )
+        if names:
+            summary += f"若只留一点，方向上先看{names}。"
+        else:
+            summary += "七个方向里也没有够格的主线。"
     elif regime == "市场偏弱":
         summary = (
             f"五个宽基里有 {len(below)} 个收盘在 MA60 下方（{weak_names}）。"
@@ -773,12 +963,21 @@ def judge(
         summary += "如果还要留一点仓，只看" + "、".join(r["方向"] for r in picks) + "。"
     elif regime == "适合降低仓位":
         summary += "防守方向自己也没站稳，留现金就行。"
+    if mvol.get("ok"):
+        summary += f"个股量能：{mvol['text']}。"
+    if turnover.get("ok") and regime not in ("不适合主动参与", "谨慎参与"):
+        summary += turnover["text"] + "。"
 
     layers = [
         {
             "层": "市场趋势",
             "状态": "下行" if downtrend else ("正常" if valid else "缺失"),
-            "说明": f"{len(valid)} 个宽基有 MA60，其中 {len(below)} 个在均线下方。",
+            "说明": f"{len(valid)} 个宽基有 MA60，其中 {len(below)} 个在均线下方。{mvol.get('text') or ''}",
+        },
+        {
+            "层": "成交额",
+            "状态": turnover.get("state") or "缺失",
+            "说明": turnover.get("text") or "两市成交额缺失",
         },
         {
             "层": "估值",
@@ -855,12 +1054,13 @@ def run_cash_regime() -> dict:
     reduction = load_reductions()
     flow = load_industry_flow()
     reports = load_reports()
+    turnover = load_market_turnover()
     pe_rows = [load_pe_anchor(name) for name in PE_ANCHORS]
     codes = [code for code, _name in MARKET]
     for item in DIRECTIONS:
         codes.extend(code for code, _name in item["etfs"])
     tech = load_etf_states(list(dict.fromkeys(codes)))
-    decision = judge(pe_rows, tech, margin, reduction, flow, us, reports)
+    decision = judge(pe_rows, tech, margin, reduction, flow, us, reports, turnover)
     prefer, extended, avoid = _pick_etfs(decision["directions"])
     gaps = []
     if not margin.get("ok"):
@@ -873,6 +1073,8 @@ def run_cash_regime() -> dict:
         gaps.append("美债")
     if not reports.get("ok"):
         gaps.append("行业研报")
+    if not turnover.get("ok"):
+        gaps.append("两市成交额")
     if gaps:
         missing = "这次没取到：" + "、".join(gaps) + "。缺的那一项记成中性，不单独改变结论。"
     else:
