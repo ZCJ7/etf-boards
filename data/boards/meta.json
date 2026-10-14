@@ -1,13 +1,13 @@
 {
-  "asof": "2026-10-12",
-  "generated_at": "2026-10-12 12:02:18",
+  "asof": "2026-10-14",
+  "generated_at": "2026-10-14 14:46:10",
   "timezone": "Asia/Shanghai",
   "source": "eastmoney",
   "momentum_denominator": "510300",
   "momentum_period": 20,
   "rows": {
-    "low_position": 5,
-    "reversal": 13,
+    "low_position": 1,
+    "reversal": 9,
     "momentum": 30
   },
   "errors": {}
